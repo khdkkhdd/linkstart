@@ -1,0 +1,15 @@
+{
+  "code": 200,
+  "message": null,
+  "content": {
+    "liveId": 1234567,
+    "liveTitle": "테스트 방송 / sample stream",
+    "status": "OPEN",
+    "liveImageUrl": "https://chzzk.example/thumb.jpg",
+    "openDate": "2026-06-04 12:34:56",
+    "channel": {
+      "channelId": "abcdef0123456789abcdef0123456789",
+      "channelName": "테스트 채널"
+    }
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "movie": {
+    "id": 987654321,
+    "live": true,
+    "title": "테스트 방송 / sample stream",
+    "telop": null
+  },
+  "fmp4": {"host": "x.example", "proto": "https"}
+}

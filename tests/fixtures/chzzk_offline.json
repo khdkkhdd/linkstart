@@ -1,0 +1,15 @@
+{
+  "code": 200,
+  "message": null,
+  "content": {
+    "liveId": null,
+    "liveTitle": null,
+    "status": "CLOSE",
+    "liveImageUrl": null,
+    "openDate": null,
+    "channel": {
+      "channelId": "abcdef0123456789abcdef0123456789",
+      "channelName": "테스트 채널"
+    }
+  }
+}

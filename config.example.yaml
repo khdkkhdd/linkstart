@@ -1,0 +1,45 @@
+# Copy to config.yaml and edit. config.yaml is gitignored.
+
+defaults:
+  save_dir: ./recordings
+  poll_interval: 60
+
+notifiers:
+  - id: main
+    type: discord
+    webhook_url: https://discord.com/api/webhooks/REPLACE_ME
+
+channels:
+  - platform: twitcasting
+    channel_id: "your_twitcasting_user_id"
+    notifier: main
+    # Optional display name for output paths, logs, and Discord embeds.
+    # Falls back to channel_id when omitted.
+    # alias: "My Channel"
+    #
+    # Optional: logged-in browser cookies (e.g. for member-only streams).
+    # Firefox is the most reliable source for an unattended daemon:
+    # on macOS, Chrome triggers a Keychain prompt and Safari requires
+    # Full Disk Access. Log in once in Firefox with "stay signed in".
+    # cookies_from_browser: firefox
+
+  # - platform: chzzk
+  #   channel_id: "<32-char-hex-uuid>"
+  #   alias: "readable-name"   # recommended — UUIDs make poor directory names
+  #   notifier: main
+  #   # Optional: Naver login cookies for 19+ / subscriber-only streams.
+  #   # cookies_from_browser: firefox
+
+  # - platform: youtube
+  #   channel_id: "@handle"   # or "UCxxxx..." channel ID
+  #   notifier: main
+  #   # Optional: override the platform's default format selector.
+  #   # The default is "137+140/bestvideo+bestaudio/best" (1080p video + AAC audio).
+  #   # format: "299+140"  # 1080p60
+  #   # Optional: cookies for member-only / age-restricted streams.
+  #   # cookies_from_browser: firefox
+
+summary:
+  enabled: true
+  cron: "0 9 * * *"   # daily 09:00 local
+  notifier: main

@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+config.yaml
+recordings/
+*.egg-info/
+dist/
+.coverage
+docs/superpowers/
