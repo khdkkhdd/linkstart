@@ -36,9 +36,12 @@ def test_build_url(channel):
     assert url == f"https://chzzk.naver.com/live/{CHANNEL_ID}"
 
 
-def test_yt_dlp_args(channel):
+def test_download_profile_is_mpegts(channel):
     p = ChzzkPlatform()
-    assert p.yt_dlp_args(channel) == ["--hls-use-mpegts"]
+    profile = p.download_profile(channel)
+    assert profile.container == "mpegts"
+    assert profile.part_suffix == ".ts"
+    assert profile.to_yt_dlp_args() == ["--hls-use-mpegts"]
 
 
 async def test_returns_live_info_when_status_open(channel):

@@ -12,6 +12,6 @@ def _fast_downloader_retry_delay(monkeypatch):
     in tests so existing 'broadcast ended → finalize' paths don't accrue 10s
     of real time per test."""
     monkeypatch.setattr(
-        "linkstart.downloader._base._DownloaderBase.IS_STILL_LIVE_RETRY_DELAY",
+        "linkstart.downloader._loop._DownloaderBase.IS_STILL_LIVE_RETRY_DELAY",
         0,
     )

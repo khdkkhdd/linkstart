@@ -7,6 +7,40 @@ from typing import Literal
 
 
 @dataclass(frozen=True)
+class DownloadProfile:
+    """How a platform's stream should be fetched by yt-dlp.
+
+    Captures the download-shaping that used to live as opaque strings in
+    ``Platform.yt_dlp_args()`` *plus* the output-container choice that was
+    previously hard-coded in the edge recorder (``part00.ts`` / ``glob("part*.ts")``).
+    Keeping both as one value object lets the recorder derive the part-file
+    extension from ``container``, so the download flag and the on-disk suffix
+    can no longer drift out of sync.
+    """
+
+    container: Literal["mpegts", "mp4"] = "mp4"
+    downloader: Literal["auto", "native", "ffmpeg"] = "auto"
+    extra_args: tuple[str, ...] = ()
+
+    @property
+    def part_suffix(self) -> str:
+        """On-disk extension for a single recorded part."""
+        return ".ts" if self.container == "mpegts" else ".mp4"
+
+    def to_yt_dlp_args(self) -> list[str]:
+        """Translate the profile into concrete yt-dlp CLI flags."""
+        args: list[str] = []
+        if self.container == "mpegts":
+            args.append("--hls-use-mpegts")
+        if self.downloader == "native":
+            args.append("--hls-prefer-native")
+        elif self.downloader == "ffmpeg":
+            args += ["--downloader", "ffmpeg"]
+        args.extend(self.extra_args)
+        return args
+
+
+@dataclass(frozen=True)
 class LiveInfo:
     """Snapshot of a single live broadcast detected by a Platform."""
 
@@ -28,6 +62,11 @@ class ChannelConfig:
     cookies_from_browser: str | None = None
     save_dir: Path = field(default_factory=lambda: Path("recordings"))
     format: str | None = None
+    # Override the yt-dlp downloader engine: "native" | "ffmpeg" | "auto".
+    # None keeps the platform's default. "native" pulls HLS via yt-dlp's own
+    # downloader, which handles fMP4 streams that the ffmpeg mpegts remux chokes
+    # on. Lets an operator switch engines per channel without a code change.
+    downloader: str | None = None
     # Human-readable display name for paths/logs/Discord. Falls back to
     # channel_id when not set (useful for opaque IDs like Chzzk UUIDs).
     alias: str | None = None

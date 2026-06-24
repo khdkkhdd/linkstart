@@ -5,7 +5,7 @@ import logging
 import aiohttp
 
 from linkstart.auth import get_browser_cookies
-from linkstart.models import ChannelConfig, LiveInfo
+from linkstart.models import ChannelConfig, DownloadProfile, LiveInfo
 from linkstart.platforms.base import Platform
 
 log = logging.getLogger(__name__)
@@ -80,8 +80,9 @@ class ChzzkPlatform(Platform):
     def build_url(self, channel: ChannelConfig, live: LiveInfo) -> str:
         return f"https://chzzk.naver.com/live/{channel.channel_id}"
 
-    def yt_dlp_args(self, channel: ChannelConfig) -> list[str]:
-        return ["--hls-use-mpegts"]
+    def _base_download_profile(self, channel: ChannelConfig) -> DownloadProfile:
+        # HLS-live → mpegts container (.ts parts + --hls-use-mpegts).
+        return DownloadProfile(container="mpegts")
 
     def get_auth_cookies(self, channel: ChannelConfig) -> dict[str, str] | None:
         if not channel.cookies_from_browser:

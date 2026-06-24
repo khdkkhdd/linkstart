@@ -1,5 +1,6 @@
 """Tests for the Downloader (edge-only mode + helpers)."""
 import asyncio
+import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -12,7 +13,22 @@ from linkstart.downloader import (
     sanitize_title,
     unique_path,
 )
-from linkstart.models import ChannelConfig, DownloadResult, EventType, LiveInfo
+from linkstart.downloader._loop import _stderr_excerpt
+from linkstart.downloader._cleanup import (
+    cleanup_dual,
+    _recover_fragments as _cleanup_recover_fragments,
+)
+from linkstart.downloader._dual import DualRecordingStrategy
+from linkstart.downloader._edge import EdgeRecordingStrategy
+from linkstart.downloader._stall import NeverAbortStallPolicy
+from linkstart.downloader._strategy import RecordingStrategy
+from linkstart.models import (
+    ChannelConfig,
+    DownloadProfile,
+    DownloadResult,
+    EventType,
+    LiveInfo,
+)
 from linkstart.platforms.base import Platform
 
 
@@ -59,16 +75,36 @@ def test_parse_epoch_no_match():
     assert _parse_epoch("random.mp4") is None
 
 
+# --- _stderr_excerpt ---
+
+def test_stderr_excerpt_short_returned_whole():
+    assert _stderr_excerpt(b"  boom happened  ") == "boom happened"
+
+
+def test_stderr_excerpt_keeps_tail_not_head():
+    # The real error lives at the END, after ffmpeg's "Opening ..." noise.
+    head = b"HEADMARKER" + b"x" * 1000
+    err = head + b"\nERROR: HTTP Error 404: Not Found"
+    out = _stderr_excerpt(err, limit=50)
+    assert out.startswith("…")
+    assert "ERROR: HTTP Error 404: Not Found" in out
+    assert "HEADMARKER" not in out  # head was dropped
+    assert len(out) <= 51  # ellipsis + limit
+
+
 # --- Edge-only record tests ---
 
 class FakePlatform(Platform):
     name = "fake"
     supports_live_from_start = False
+    # Edge/HLS-style fake → mpegts container (.ts parts), mirroring TwitCasting.
+    _container = "mpegts"
 
     def __init__(self, *, check_results, yt_dlp_args_value=None):
         self._results = list(check_results)
         self.calls = 0
-        self._yt_dlp_args = yt_dlp_args_value or ["--flag-x"]
+        # Legacy knob: extra flags injected into the download profile.
+        self._extra_args = tuple(yt_dlp_args_value) if yt_dlp_args_value is not None else ()
 
     async def check_live(self, channel):
         self.calls += 1
@@ -77,14 +113,20 @@ class FakePlatform(Platform):
     def build_url(self, channel, live):
         return f"https://fake/{channel.channel_id}"
 
-    def yt_dlp_args(self, channel):
-        return list(self._yt_dlp_args)
+    def download_profile(self, channel):
+        return DownloadProfile(container=self._container, extra_args=self._extra_args)
 
 
 class FakePlatformDual(FakePlatform):
     """Same fake but flagged as supporting from-start, for Task 5/6 tests."""
     supports_live_from_start = True
     default_format = "137+140/bestvideo+bestaudio/best"
+    # YouTube-style dual recorder writes .mp4 directly (no --hls-use-mpegts).
+    _container = "mp4"
+
+    def recording_strategy(self, infra):
+        from linkstart.downloader._dual import DualRecordingStrategy
+        return DualRecordingStrategy(infra)
 
 
 class FakeProc:
@@ -124,9 +166,9 @@ async def test_edge_only_records_successfully_on_first_try(channel, live):
         target.write_bytes(b"finaldata")
         return True
 
-    with patch.object(dl, "_remux_ts_to_mp4", new=AsyncMock(side_effect=fake_remux)):
+    with patch.object(dl.media, "remux", new=AsyncMock(side_effect=fake_remux)):
         with patch(
-            "linkstart.downloader._base.asyncio.create_subprocess_exec",
+            "linkstart.downloader._process.asyncio.create_subprocess_exec",
             new=AsyncMock(side_effect=fake_exec),
         ):
             result = await dl.record(channel, plat, live)
@@ -136,6 +178,33 @@ async def test_edge_only_records_successfully_on_first_try(channel, live):
     assert result.file_path.exists()
     assert result.retry_count == 0
     assert result.extra_files == []
+
+
+async def test_edge_only_logs_broadcast_ended(channel, live, caplog):
+    """When the attempt loop concludes the broadcast is no longer live, it must
+    say so — otherwise the recording just stops with no logged reason."""
+    plat = FakePlatform(check_results=[None])  # not live after the first attempt
+    dl = Downloader()
+
+    async def fake_exec(*args, **kwargs):
+        out_idx = args.index("-o")
+        Path(args[out_idx + 1]).write_bytes(b"fakedata")
+        return FakeProc(returncode=0)
+
+    async def fake_remux(part, target):
+        target.write_bytes(b"finaldata")
+        return True
+
+    with caplog.at_level(logging.INFO, logger="linkstart.downloader._loop"):
+        with patch.object(dl.media, "remux", new=AsyncMock(side_effect=fake_remux)):
+            with patch(
+                "linkstart.downloader._process.asyncio.create_subprocess_exec",
+                new=AsyncMock(side_effect=fake_exec),
+            ):
+                await dl.record(channel, plat, live)
+
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("broadcast ended" in m and live.live_id in m for m in msgs), msgs
 
 
 async def test_edge_only_restarts_until_stream_ends(channel, live):
@@ -156,9 +225,9 @@ async def test_edge_only_restarts_until_stream_ends(channel, live):
         target.write_bytes(b"final")
         return True
 
-    with patch.object(dl, "_remux_ts_to_mp4", new=AsyncMock(side_effect=fake_remux)):
+    with patch.object(dl.media, "remux", new=AsyncMock(side_effect=fake_remux)):
         with patch(
-            "linkstart.downloader._base.asyncio.create_subprocess_exec",
+            "linkstart.downloader._process.asyncio.create_subprocess_exec",
             new=AsyncMock(side_effect=fake_exec),
         ):
             result = await dl.record(channel, plat, live)
@@ -179,13 +248,31 @@ async def test_edge_only_no_parts_returns_failure(channel, live):
         return FakeProc(returncode=1)
 
     with patch(
-        "linkstart.downloader._base.asyncio.create_subprocess_exec",
+        "linkstart.downloader._process.asyncio.create_subprocess_exec",
         new=AsyncMock(side_effect=fake_exec),
     ):
         result = await dl.record(channel, plat, live)
 
     assert result.success is False
     assert result.error == "no parts captured"
+
+
+async def test_edge_only_cleans_up_parts_dir_on_failure(channel, live):
+    """A failed recording must not leave an orphan .parts directory behind."""
+    plat = FakePlatform(check_results=[None])
+    dl = Downloader()
+
+    async def fake_exec(*args, **kwargs):
+        return FakeProc(returncode=1)   # never writes output
+
+    with patch(
+        "linkstart.downloader._process.asyncio.create_subprocess_exec",
+        new=AsyncMock(side_effect=fake_exec),
+    ):
+        result = await dl.record(channel, plat, live)
+
+    assert result.success is False
+    assert list(channel.save_dir.rglob("*.parts")) == []
 
 
 async def test_edge_only_fires_on_interrupted_callback(channel, live):
@@ -206,9 +293,9 @@ async def test_edge_only_fires_on_interrupted_callback(channel, live):
         target.write_bytes(b"final")
         return True
 
-    with patch.object(dl, "_remux_ts_to_mp4", new=AsyncMock(side_effect=fake_remux)):
+    with patch.object(dl.media, "remux", new=AsyncMock(side_effect=fake_remux)):
         with patch(
-            "linkstart.downloader._base.asyncio.create_subprocess_exec",
+            "linkstart.downloader._process.asyncio.create_subprocess_exec",
             new=AsyncMock(side_effect=fake_exec),
         ):
             await dl.record(channel, plat, live, on_interrupted=on_interrupted)
@@ -220,7 +307,7 @@ async def test_edge_only_fires_on_interrupted_callback(channel, live):
 
 def test_build_args_edge_no_live_from_start(tmp_path):
     dl = Downloader()
-    plat = FakePlatform(check_results=[], yt_dlp_args_value=["--hls-use-mpegts"])
+    plat = FakePlatform(check_results=[])  # mpegts profile → --hls-use-mpegts
     ch = ChannelConfig(platform="fake", channel_id="abc",
                        save_dir=tmp_path / "rec")
     live = LiveInfo(live_id="100", title="t", url="https://fake/abc")
@@ -303,9 +390,9 @@ async def test_edge_only_multiple_parts_produce_separate_mp4s(channel, live):
         target.write_bytes(b"remuxed_" + part.name.encode())
         return True
 
-    with patch.object(dl, "_remux_ts_to_mp4", new=AsyncMock(side_effect=fake_remux)):
+    with patch.object(dl.media, "remux", new=AsyncMock(side_effect=fake_remux)):
         with patch(
-            "linkstart.downloader._base.asyncio.create_subprocess_exec",
+            "linkstart.downloader._process.asyncio.create_subprocess_exec",
             new=AsyncMock(side_effect=fake_exec),
         ):
             result = await dl.record(channel, plat, live)
@@ -336,9 +423,9 @@ async def test_edge_only_main_remux_failure_returns_failure(channel, live):
     async def fake_remux(part, target):
         return False   # main remux fails
 
-    with patch.object(dl, "_remux_ts_to_mp4", new=AsyncMock(side_effect=fake_remux)):
+    with patch.object(dl.media, "remux", new=AsyncMock(side_effect=fake_remux)):
         with patch(
-            "linkstart.downloader._base.asyncio.create_subprocess_exec",
+            "linkstart.downloader._process.asyncio.create_subprocess_exec",
             new=AsyncMock(side_effect=fake_exec),
         ):
             result = await dl.record(channel, plat, live)
@@ -367,9 +454,9 @@ async def test_edge_only_extra_remux_failure_skipped(channel, live):
             return True
         return False   # second remux (the extra) fails
 
-    with patch.object(dl, "_remux_ts_to_mp4", new=AsyncMock(side_effect=fake_remux)):
+    with patch.object(dl.media, "remux", new=AsyncMock(side_effect=fake_remux)):
         with patch(
-            "linkstart.downloader._base.asyncio.create_subprocess_exec",
+            "linkstart.downloader._process.asyncio.create_subprocess_exec",
             new=AsyncMock(side_effect=fake_exec),
         ):
             result = await dl.record(channel, plat, live)
@@ -390,9 +477,9 @@ async def test_edge_only_returns_failure_when_remux_fails(channel, live):
     async def fake_remux(part, target):
         return False   # simulate ffmpeg remux failure
 
-    with patch.object(dl, "_remux_ts_to_mp4", new=AsyncMock(side_effect=fake_remux)):
+    with patch.object(dl.media, "remux", new=AsyncMock(side_effect=fake_remux)):
         with patch(
-            "linkstart.downloader._base.asyncio.create_subprocess_exec",
+            "linkstart.downloader._process.asyncio.create_subprocess_exec",
             new=AsyncMock(side_effect=fake_exec),
         ):
             result = await dl.record(channel, plat, live)
@@ -406,9 +493,13 @@ async def test_edge_only_sleeps_between_attempts_when_configured(channel, live, 
     plat = FakePlatform(check_results=[live, None])
     dl = Downloader()
     sleeps: list[float] = []
+    real_sleep = asyncio.sleep   # capture before patch
 
     async def fake_sleep(seconds):
         sleeps.append(seconds)
+        # Yield to the scheduler so the stall watchdog's poll loop (which also
+        # awaits asyncio.sleep) does not starve the event loop under this patch.
+        await real_sleep(0)
 
     async def fake_exec(*args, **kwargs):
         out_idx = args.index("-o")
@@ -419,12 +510,12 @@ async def test_edge_only_sleeps_between_attempts_when_configured(channel, live, 
         target.write_bytes(b"final")
         return True
 
-    monkeypatch.setattr(Downloader, "EDGE_LOOP_SLEEP", 2.5)
+    monkeypatch.setattr(EdgeRecordingStrategy, "EDGE_LOOP_SLEEP", 2.5)
     monkeypatch.setattr("linkstart.downloader._edge.asyncio.sleep", fake_sleep)
 
-    with patch.object(dl, "_remux_ts_to_mp4", new=AsyncMock(side_effect=fake_remux)):
+    with patch.object(dl.media, "remux", new=AsyncMock(side_effect=fake_remux)):
         with patch(
-            "linkstart.downloader._base.asyncio.create_subprocess_exec",
+            "linkstart.downloader._process.asyncio.create_subprocess_exec",
             new=AsyncMock(side_effect=fake_exec),
         ):
             await dl.record(channel, plat, live)
@@ -450,9 +541,9 @@ async def test_edge_only_summary_append_exception_is_swallowed(channel, live, mo
         target.write_bytes(b"final")
         return True
 
-    with patch.object(dl, "_remux_ts_to_mp4", new=AsyncMock(side_effect=fake_remux)):
+    with patch.object(dl.media, "remux", new=AsyncMock(side_effect=fake_remux)):
         with patch(
-            "linkstart.downloader._base.asyncio.create_subprocess_exec",
+            "linkstart.downloader._process.asyncio.create_subprocess_exec",
             new=AsyncMock(side_effect=fake_exec),
         ):
             result = await dl.record(channel, plat, live)
@@ -486,9 +577,9 @@ async def test_edge_only_appends_summary_record(channel, live, tmp_path, monkeyp
         target.write_bytes(b"final")
         return True
 
-    with patch.object(dl, "_remux_ts_to_mp4", new=AsyncMock(side_effect=fake_remux)):
+    with patch.object(dl.media, "remux", new=AsyncMock(side_effect=fake_remux)):
         with patch(
-            "linkstart.downloader._base.asyncio.create_subprocess_exec",
+            "linkstart.downloader._process.asyncio.create_subprocess_exec",
             new=AsyncMock(side_effect=fake_exec),
         ):
             result = await dl.record(channel, plat, live)
@@ -509,7 +600,7 @@ def test_parts_dir_uses_alias_when_set(tmp_path):
         save_dir=tmp_path / "rec",
     )
     live = LiveInfo(live_id="123", title="t", url="https://x")
-    parts_dir = dl._make_parts_dir(ch, live)
+    parts_dir = dl.paths.make_parts_dir(ch, live)
     assert "mychannel" in str(parts_dir)
     assert "abcdef0123456789abcdef0123456789" not in str(parts_dir)
 
@@ -522,7 +613,7 @@ def test_parts_dir_falls_back_to_channel_id_without_alias(tmp_path):
         save_dir=tmp_path / "rec",
     )
     live = LiveInfo(live_id="1", title="t", url="https://x")
-    parts_dir = dl._make_parts_dir(ch, live)
+    parts_dir = dl.paths.make_parts_dir(ch, live)
     assert "somehandle" in str(parts_dir)
 
 
@@ -535,7 +626,7 @@ def test_final_path_uses_alias_when_set(tmp_path):
         save_dir=tmp_path / "rec",
     )
     live = LiveInfo(live_id="1", title="제목", url="https://x")
-    final = dl._final_path(ch, live)
+    final = dl.paths.final_path(ch, live)
     assert "mychannel" in str(final)
 
 
@@ -597,13 +688,13 @@ async def test_edge_only_gives_up_after_consecutive_no_output_failures(channel, 
         return FakeProc(returncode=1)
 
     with patch(
-        "linkstart.downloader._base.asyncio.create_subprocess_exec",
+        "linkstart.downloader._process.asyncio.create_subprocess_exec",
         new=AsyncMock(side_effect=fake_exec),
     ):
         result = await dl.record(channel, plat, live)
 
     assert result.success is False
-    assert exec_count["n"] == Downloader.NO_OUTPUT_FAIL_LIMIT
+    assert exec_count["n"] == EdgeRecordingStrategy.NO_OUTPUT_FAIL_LIMIT
     assert "without producing output" in (result.error or "")
     # The last stderr is surfaced for diagnosis.
     assert "some stderr" in (result.error or "")
@@ -622,13 +713,13 @@ async def test_edge_only_gives_up_when_exit_zero_produces_no_output(channel, liv
         return FakeProc(returncode=0)
 
     with patch(
-        "linkstart.downloader._base.asyncio.create_subprocess_exec",
+        "linkstart.downloader._process.asyncio.create_subprocess_exec",
         new=AsyncMock(side_effect=fake_exec),
     ):
         result = await dl.record(channel, plat, live)
 
     assert result.success is False
-    assert exec_count["n"] == Downloader.NO_OUTPUT_FAIL_LIMIT
+    assert exec_count["n"] == EdgeRecordingStrategy.NO_OUTPUT_FAIL_LIMIT
     assert "without producing output" in (result.error or "")
 
 
@@ -654,9 +745,9 @@ async def test_edge_only_no_output_counter_resets_when_data_produced(channel, li
         target.write_bytes(b"final")
         return True
 
-    with patch.object(dl, "_remux_ts_to_mp4", new=AsyncMock(side_effect=fake_remux)):
+    with patch.object(dl.media, "remux", new=AsyncMock(side_effect=fake_remux)):
         with patch(
-            "linkstart.downloader._base.asyncio.create_subprocess_exec",
+            "linkstart.downloader._process.asyncio.create_subprocess_exec",
             new=AsyncMock(side_effect=fake_exec),
         ):
             result = await dl.record(channel, plat, live)
@@ -669,7 +760,7 @@ async def test_edge_only_no_output_counter_resets_when_data_produced(channel, li
 
 
 async def test_dual_loops_give_up_after_consecutive_no_output_failures(channel, live, monkeypatch):
-    monkeypatch.setattr(Downloader, "FULL_LOOP_SLEEP", 0.0)
+    monkeypatch.setattr(DualRecordingStrategy, "FULL_LOOP_SLEEP", 0.0)
     plat = FakePlatformDual(check_results=[live] * 40)
     dl = Downloader()
     exec_count = {"full": 0, "edge": 0}
@@ -682,14 +773,14 @@ async def test_dual_loops_give_up_after_consecutive_no_output_failures(channel, 
         return FakeProc(returncode=1)
 
     with patch(
-        "linkstart.downloader._base.asyncio.create_subprocess_exec",
+        "linkstart.downloader._process.asyncio.create_subprocess_exec",
         new=AsyncMock(side_effect=fake_exec),
     ):
         result = await asyncio.wait_for(dl.record(channel, plat, live), timeout=5.0)
 
     assert result.success is False
-    assert exec_count["full"] == Downloader.NO_OUTPUT_FAIL_LIMIT
-    assert exec_count["edge"] == Downloader.NO_OUTPUT_FAIL_LIMIT
+    assert exec_count["full"] == DualRecordingStrategy.NO_OUTPUT_FAIL_LIMIT
+    assert exec_count["edge"] == DualRecordingStrategy.NO_OUTPUT_FAIL_LIMIT
     # The bail-out diagnosis (yt-dlp stderr) must survive into the result —
     # it is what the operator sees on Discord.
     assert "without producing output" in (result.error or "")
@@ -709,15 +800,15 @@ async def test_dual_runs_both_loops_then_cleanup(channel, live, tmp_path):
         Path(args[out_idx + 1]).write_bytes(b"data")
         return FakeProc(returncode=0)
 
-    async def fake_cleanup(channel, live, parts_dir, *, retry_count, full_restarted=False):
+    async def fake_cleanup(paths, media, channel, live, parts_dir, *, retry_count, full_restarted=False):
         # Pretend cleanup succeeded with a known base path.
         base = parts_dir.parent / "fake_base.mp4"
         base.write_bytes(b"base")
         return DownloadResult(success=False)
 
-    with patch.object(dl, "_cleanup_dual", new=AsyncMock(side_effect=fake_cleanup)):
+    with patch("linkstart.downloader._dual.cleanup_dual", new=AsyncMock(side_effect=fake_cleanup)):
         with patch(
-            "linkstart.downloader._base.asyncio.create_subprocess_exec",
+            "linkstart.downloader._process.asyncio.create_subprocess_exec",
             new=AsyncMock(side_effect=fake_exec),
         ):
             await dl.record(channel, plat, live)
@@ -733,9 +824,12 @@ async def test_dual_full_loop_uses_sleep_5(monkeypatch, channel, live):
     plat = FakePlatformDual(check_results=[live, None, None])
     dl = Downloader()
     sleeps: list[float] = []
+    real_sleep = asyncio.sleep   # capture before patch
 
     async def fake_sleep(seconds):
         sleeps.append(seconds)
+        # Yield so the stall watchdog's poll loop does not starve the loop.
+        await real_sleep(0)
 
     async def fake_exec(*args, **kwargs):
         out_idx = args.index("-o")
@@ -746,9 +840,9 @@ async def test_dual_full_loop_uses_sleep_5(monkeypatch, channel, live):
         return DownloadResult(success=False)
 
     monkeypatch.setattr("linkstart.downloader._dual.asyncio.sleep", fake_sleep)
-    with patch.object(dl, "_cleanup_dual", new=AsyncMock(side_effect=fake_cleanup)):
+    with patch("linkstart.downloader._dual.cleanup_dual", new=AsyncMock(side_effect=fake_cleanup)):
         with patch(
-            "linkstart.downloader._base.asyncio.create_subprocess_exec",
+            "linkstart.downloader._process.asyncio.create_subprocess_exec",
             new=AsyncMock(side_effect=fake_exec),
         ):
             await dl.record(channel, plat, live)
@@ -778,7 +872,7 @@ async def test_dual_edge_loop_restarts_and_warns_on_nonzero(channel, live, monke
 
     plat = CountingPlatform(alive_for=6)
     dl = Downloader()
-    monkeypatch.setattr(Downloader, "EDGE_LOOP_SLEEP", 0.01)
+    monkeypatch.setattr(DualRecordingStrategy, "EDGE_LOOP_SLEEP", 0.01)
     sleeps: list[float] = []
     real_sleep = asyncio.sleep   # capture before patch
 
@@ -798,9 +892,9 @@ async def test_dual_edge_loop_restarts_and_warns_on_nonzero(channel, live, monke
     async def fake_cleanup(*a, **kw):
         return DownloadResult(success=False)
 
-    with patch.object(dl, "_cleanup_dual", new=AsyncMock(side_effect=fake_cleanup)):
+    with patch("linkstart.downloader._dual.cleanup_dual", new=AsyncMock(side_effect=fake_cleanup)):
         with patch(
-            "linkstart.downloader._base.asyncio.create_subprocess_exec",
+            "linkstart.downloader._process.asyncio.create_subprocess_exec",
             new=AsyncMock(side_effect=fake_exec),
         ):
             await dl.record(channel, plat, live)
@@ -832,9 +926,9 @@ async def test_dual_unique_output_raises_after_100_collisions(channel, live, mon
     async def fake_cleanup(*a, **kw):
         return DownloadResult(success=False)
 
-    with patch.object(dl, "_cleanup_dual", new=AsyncMock(side_effect=fake_cleanup)):
+    with patch("linkstart.downloader._dual.cleanup_dual", new=AsyncMock(side_effect=fake_cleanup)):
         with patch(
-            "linkstart.downloader._base.asyncio.create_subprocess_exec",
+            "linkstart.downloader._process.asyncio.create_subprocess_exec",
             new=AsyncMock(side_effect=fake_exec),
         ):
             with pytest.raises(RuntimeError, match="could not find unique output"):
@@ -858,9 +952,9 @@ async def test_dual_fires_interrupted_callback(channel, live, tmp_path):
     async def fake_cleanup(*a, **kw):
         return DownloadResult(success=False)
 
-    with patch.object(dl, "_cleanup_dual", new=AsyncMock(side_effect=fake_cleanup)):
+    with patch("linkstart.downloader._dual.cleanup_dual", new=AsyncMock(side_effect=fake_cleanup)):
         with patch(
-            "linkstart.downloader._base.asyncio.create_subprocess_exec",
+            "linkstart.downloader._process.asyncio.create_subprocess_exec",
             new=AsyncMock(side_effect=fake_exec),
         ):
             await dl.record(channel, plat, live, on_interrupted=on_interrupted)
@@ -891,9 +985,9 @@ async def test_dual_unique_output_resolves_epoch_collision(channel, live,
     async def fake_cleanup(*a, **kw):
         return DownloadResult(success=False)
 
-    with patch.object(dl, "_cleanup_dual", new=AsyncMock(side_effect=fake_cleanup)):
+    with patch("linkstart.downloader._dual.cleanup_dual", new=AsyncMock(side_effect=fake_cleanup)):
         with patch(
-            "linkstart.downloader._base.asyncio.create_subprocess_exec",
+            "linkstart.downloader._process.asyncio.create_subprocess_exec",
             new=AsyncMock(side_effect=fake_exec),
         ):
             await dl.record(channel, plat, live)
@@ -926,7 +1020,7 @@ async def test_notify_interrupted_fires_first(channel, live, monkeypatch):
     async def cb(event):
         events.append(event)
 
-    cooldown = Cooldown(dl.INTERRUPTED_DEDUP_SEC)
+    cooldown = Cooldown(RecordingStrategy.INTERRUPTED_DEDUP_SEC)
     await dl._notify_interrupted(
         cb, channel, live, loop="edge", attempt=1, cooldown=cooldown
     )
@@ -942,7 +1036,7 @@ async def test_notify_interrupted_dedupes_within_window(channel, live, monkeypat
     async def cb(event):
         events.append(event)
 
-    cooldown = Cooldown(dl.INTERRUPTED_DEDUP_SEC)
+    cooldown = Cooldown(RecordingStrategy.INTERRUPTED_DEDUP_SEC)
     await dl._notify_interrupted(
         cb, channel, live, loop="edge", attempt=1, cooldown=cooldown
     )
@@ -970,11 +1064,11 @@ async def test_notify_interrupted_fires_again_after_window(channel, live, monkey
     async def cb(event):
         events.append(event)
 
-    cooldown = Cooldown(dl.INTERRUPTED_DEDUP_SEC)
+    cooldown = Cooldown(RecordingStrategy.INTERRUPTED_DEDUP_SEC)
     await dl._notify_interrupted(
         cb, channel, live, loop="edge", attempt=1, cooldown=cooldown
     )
-    clock.advance(Downloader.INTERRUPTED_DEDUP_SEC + 1.0)
+    clock.advance(RecordingStrategy.INTERRUPTED_DEDUP_SEC + 1.0)
     await dl._notify_interrupted(
         cb, channel, live, loop="edge", attempt=2, cooldown=cooldown
     )
@@ -989,7 +1083,7 @@ async def test_notify_interrupted_no_callback_does_not_consume_cooldown(channel,
     async def cb(event):
         events.append(event)
 
-    cooldown = Cooldown(dl.INTERRUPTED_DEDUP_SEC)
+    cooldown = Cooldown(RecordingStrategy.INTERRUPTED_DEDUP_SEC)
     await dl._notify_interrupted(
         None, channel, live, loop="edge", attempt=1, cooldown=cooldown
     )
@@ -1012,7 +1106,7 @@ async def test_notify_interrupted_swallows_callback_exception(channel, live):
     async def cb(event):
         events.append(event)
 
-    cooldown = Cooldown(dl.INTERRUPTED_DEDUP_SEC)
+    cooldown = Cooldown(RecordingStrategy.INTERRUPTED_DEDUP_SEC)
     # Must not raise.
     await dl._notify_interrupted(
         boom, channel, live, loop="edge", attempt=1, cooldown=cooldown
@@ -1056,11 +1150,11 @@ async def test_run_proc_kills_when_wait_is_cancelled():
         return proc
 
     with patch(
-        "linkstart.downloader._base.asyncio.create_subprocess_exec",
+        "linkstart.downloader._process.asyncio.create_subprocess_exec",
         new=AsyncMock(side_effect=fake_exec),
     ):
         with pytest.raises(asyncio.CancelledError):
-            await dl._run_proc(["yt-dlp"])
+            await dl.process.run(["yt-dlp"])
 
     assert proc.terminate_called is True
     assert proc.kill_called is True
@@ -1130,7 +1224,7 @@ async def test_is_still_live_with_retries_returns_true_on_recovery(channel, live
     async def fake_sleep(seconds):
         sleeps.append(seconds)
 
-    monkeypatch.setattr("linkstart.downloader._base.asyncio.sleep", fake_sleep)
+    monkeypatch.setattr("linkstart.downloader._loop.asyncio.sleep", fake_sleep)
     assert await dl._is_still_live_with_retries(plat, channel, live) is True
     # Two check_live calls: initial False, retry returned True.
     assert plat.calls == 2
@@ -1149,7 +1243,7 @@ async def test_is_still_live_with_retries_gives_up_after_all_fail(channel, live,
     async def fake_sleep(seconds):
         sleeps.append(seconds)
 
-    monkeypatch.setattr("linkstart.downloader._base.asyncio.sleep", fake_sleep)
+    monkeypatch.setattr("linkstart.downloader._loop.asyncio.sleep", fake_sleep)
     assert await dl._is_still_live_with_retries(plat, channel, live) is False
     assert plat.calls == dl.IS_STILL_LIVE_RETRIES
     # Delays are inserted between attempts but NOT after the last one.
@@ -1166,7 +1260,7 @@ async def test_is_still_live_with_retries_short_circuits_on_first_true(channel, 
     async def fake_sleep(seconds):
         sleeps.append(seconds)
 
-    monkeypatch.setattr("linkstart.downloader._base.asyncio.sleep", fake_sleep)
+    monkeypatch.setattr("linkstart.downloader._loop.asyncio.sleep", fake_sleep)
     assert await dl._is_still_live_with_retries(plat, channel, live) is True
     assert plat.calls == 1
     assert sleeps == []
@@ -1191,9 +1285,9 @@ async def test_edge_only_breaks_and_saves_when_stop_signaled(channel, live, tmp_
         target.write_bytes(b"final")
         return True
 
-    with patch.object(dl, "_remux_ts_to_mp4", new=AsyncMock(side_effect=fake_remux)):
+    with patch.object(dl.media, "remux", new=AsyncMock(side_effect=fake_remux)):
         with patch(
-            "linkstart.downloader._base.asyncio.create_subprocess_exec",
+            "linkstart.downloader._process.asyncio.create_subprocess_exec",
             new=AsyncMock(side_effect=fake_exec),
         ):
             task = asyncio.create_task(
@@ -1215,6 +1309,402 @@ async def test_edge_only_breaks_and_saves_when_stop_signaled(channel, live, tmp_
     assert procs[0].terminate_called is True
 
 
+async def test_edge_only_watchdog_aborts_stalled_download(channel, live, monkeypatch):
+    """A download that produces no growing output is aborted (SIGTERM) by the
+    stall watchdog instead of being left to hang indefinitely."""
+    plat = FakePlatform(check_results=[None])  # broadcast 'ends' after the attempt
+    dl = Downloader()
+    monkeypatch.setattr(EdgeRecordingStrategy, "EDGE_STALL_SEC", 0.0)
+    monkeypatch.setattr(EdgeRecordingStrategy, "EDGE_STALL_GRACE_SEC", 0.0)
+    dl.WATCHDOG_POLL_SEC = 0.01
+    procs: list[TerminatableProc] = []
+
+    async def fake_exec(*args, **kwargs):
+        proc = TerminatableProc(mode="hang")  # never exits on its own
+        procs.append(proc)
+        return proc  # writes NO output → never grows
+
+    with patch(
+        "linkstart.downloader._process.asyncio.create_subprocess_exec",
+        new=AsyncMock(side_effect=fake_exec),
+    ):
+        result = await asyncio.wait_for(dl.record(channel, plat, live), timeout=2.0)
+
+    assert procs[0].terminate_called is True
+    assert result.success is False
+
+
+async def test_edge_only_aborts_slow_trickle_via_throughput_floor(channel, live, monkeypatch):
+    """A download that writes a tiny stub and then only trickles (so the
+    zero-growth watchdog never fires) must still be aborted by the minimum
+    throughput floor — the real TwitCasting bug (27 KB over 44 min). The
+    zero-growth window is disabled here so ONLY the throughput policy can abort."""
+    plat = FakePlatform(check_results=[None])  # broadcast ends after the attempt
+    dl = Downloader()
+    # Make the zero-growth watchdog effectively never fire.
+    monkeypatch.setattr(EdgeRecordingStrategy, "EDGE_STALL_SEC", 10_000.0)
+    monkeypatch.setattr(EdgeRecordingStrategy, "EDGE_STALL_GRACE_SEC", 0.0)
+    # Throughput floor: evaluate immediately, demand an absurd rate so the tiny
+    # stub is judged "too slow" within the first poll.
+    monkeypatch.setattr(EdgeRecordingStrategy, "EDGE_MIN_RATE_WINDOW_SEC", 0.0)
+    monkeypatch.setattr(EdgeRecordingStrategy, "EDGE_MIN_BYTES_PER_SEC", 1e9)
+    dl.WATCHDOG_POLL_SEC = 0.01
+    procs: list[TerminatableProc] = []
+
+    async def fake_exec(*args, **kwargs):
+        proc = TerminatableProc(mode="hang")  # never exits on its own
+        procs.append(proc)
+        out_idx = args.index("-o")
+        # Tiny stub that never grows → since_growth keeps rising, but the
+        # zero-growth window is too long to fire. Only throughput can abort.
+        Path(args[out_idx + 1] + ".part").write_bytes(b"x" * 100)
+        return proc
+
+    with patch(
+        "linkstart.downloader._process.asyncio.create_subprocess_exec",
+        new=AsyncMock(side_effect=fake_exec),
+    ):
+        result = await asyncio.wait_for(dl.record(channel, plat, live), timeout=2.0)
+
+    assert procs[0].terminate_called is True
+    assert result.success is False
+
+
+async def test_edge_only_gives_up_after_repeated_stalls(channel, live, monkeypatch):
+    """Stalled attempts count as no-progress even when a tiny stub was written
+    (e.g. the 56KB fMP4 init), so the loop gives up at NO_OUTPUT_FAIL_LIMIT
+    rather than churning forever."""
+    plat = FakePlatform(check_results=[live] * 50)  # always still-live
+    dl = Downloader()
+    monkeypatch.setattr(EdgeRecordingStrategy, "EDGE_STALL_SEC", 0.0)
+    monkeypatch.setattr(EdgeRecordingStrategy, "EDGE_STALL_GRACE_SEC", 0.0)
+    dl.WATCHDOG_POLL_SEC = 0.01
+    procs: list[TerminatableProc] = []
+
+    async def fake_exec(*args, **kwargs):
+        proc = TerminatableProc(mode="hang")
+        procs.append(proc)
+        out_idx = args.index("-o")
+        # Write a tiny stub like a stalled stream's init segment.
+        Path(args[out_idx + 1] + ".part").write_bytes(b"x" * 100)
+        return proc
+
+    with patch(
+        "linkstart.downloader._process.asyncio.create_subprocess_exec",
+        new=AsyncMock(side_effect=fake_exec),
+    ):
+        result = await asyncio.wait_for(dl.record(channel, plat, live), timeout=3.0)
+
+    assert result.success is False
+    assert "stall" in (result.error or "").lower()
+    # Gave up at the limit — did NOT loop through all 50 still-live checks.
+    assert len(procs) == EdgeRecordingStrategy.NO_OUTPUT_FAIL_LIMIT
+
+
+async def test_heartbeat_label_includes_loop_name(channel, live, caplog, monkeypatch):
+    """Heartbeats must name the loop (full/edge) so the two concurrent dual-mode
+    recordings are distinguishable in the log — not two identical 'recording
+    youtube/Ao' lines."""
+    plat = FakePlatform(check_results=[None])
+    dl = Downloader()
+    dl.HEARTBEAT_INTERVAL_SEC = 0.0           # emit on the first poll
+    dl.WATCHDOG_POLL_SEC = 0.01
+    monkeypatch.setattr(EdgeRecordingStrategy, "EDGE_STALL_SEC", 0.0)           # abort right after the heartbeat
+    monkeypatch.setattr(EdgeRecordingStrategy, "EDGE_STALL_GRACE_SEC", 0.0)
+    monkeypatch.setattr(EdgeRecordingStrategy, "EDGE_MIN_RATE_WINDOW_SEC", 10_000.0)     # keep throughput policy from racing
+
+    async def fake_exec(*args, **kwargs):
+        proc = TerminatableProc(mode="hang")
+        out_idx = args.index("-o")
+        Path(args[out_idx + 1] + ".part").write_bytes(b"x" * 100)
+        return proc
+
+    with caplog.at_level(logging.INFO, logger="linkstart.downloader._watchdog"):
+        with patch(
+            "linkstart.downloader._process.asyncio.create_subprocess_exec",
+            new=AsyncMock(side_effect=fake_exec),
+        ):
+            await asyncio.wait_for(dl.record(channel, plat, live), timeout=2.0)
+
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("recording" in m and "[edge]" in m for m in msgs), msgs
+
+
+async def test_watchdog_emits_progress_heartbeat(tmp_path, caplog):
+    """A running recording must log a periodic heartbeat with size + rate, so a
+    healthy capture and a stuck one are distinguishable in the log instead of
+    both being silent between the 'attempt' and 'exited' lines."""
+    from linkstart.downloader._stall import StallPolicy
+    from linkstart.downloader._watchdog import Heartbeat, StallWatchdog
+
+    class _AbortAfter(StallPolicy):
+        poll_sec = 0.01
+
+        def __init__(self, n):
+            self.n = n
+            self.calls = 0
+
+        def should_abort(self, *, elapsed, bytes_written, since_growth):
+            self.calls += 1
+            return self.calls >= self.n
+
+    dl = Downloader()
+    out = tmp_path / "part00.ts"
+    # yt-dlp's in-progress temp file (matched by stem) — ~2 MB written so far.
+    (tmp_path / "part00.ts.part").write_bytes(b"x" * 2_000_000)
+
+    hb = Heartbeat("twitcasting/Ao", dl.media, interval_sec=0.0)
+    with caplog.at_level(logging.INFO, logger="linkstart.downloader._watchdog"):
+        await asyncio.wait_for(
+            StallWatchdog(out, _AbortAfter(2), hb).watch(),
+            timeout=2.0,
+        )
+
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("twitcasting/Ao" in m and "MB" in m for m in msgs), msgs
+
+
+async def test_run_proc_with_stop_kills_orphaned_grandchild(tmp_path):
+    """The deadlock that wedged the TwitCasting worker: yt-dlp (the direct child)
+    spawns ffmpeg (a grandchild) that inherits the captured stderr pipe. On stop,
+    signalling only the direct child leaves the grandchild holding the pipe open,
+    so proc.communicate() never sees EOF and the worker hangs forever.
+
+    Launching the child in its own process group and killing the whole group on
+    teardown reaps the grandchild too, so communicate() returns promptly.
+    """
+    import sys
+
+    dl = Downloader()
+    # Parent spawns a grandchild that inherits stderr (fd 2) and sleeps well past
+    # the test window, then the parent also sleeps. Without a process-group kill,
+    # the grandchild keeps the stderr pipe open and communicate() blocks.
+    code = (
+        "import sys, subprocess, time;"
+        "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']);"
+        "time.sleep(30)"
+    )
+    args = [sys.executable, "-c", code]
+    stop = asyncio.Event()
+
+    task = asyncio.create_task(
+        dl.run_attempt(args, stop, stall_policy=NeverAbortStallPolicy())
+    )
+    # Let the parent actually spawn the grandchild and both inherit the pipe
+    # BEFORE we ask for shutdown — otherwise we'd terminate the parent before a
+    # grandchild even exists and the deadlock would never arise.
+    await asyncio.sleep(0.7)
+    stop.set()
+
+    returncode, stderr, stalled = await asyncio.wait_for(task, timeout=8.0)
+    # The call returned (no hang) because the whole group — including the
+    # grandchild — was killed, letting communicate() observe EOF.
+    assert stalled is False  # stop, not the watchdog, ended this run
+
+
+async def test_watchdog_heartbeat_flags_no_growth(tmp_path, caplog):
+    """When the output isn't growing, the heartbeat must say so — that's the
+    early-warning that a recording is stalling, BEFORE the watchdog's abort
+    window elapses (so a frozen capture is obvious in the log)."""
+    from linkstart.downloader._stall import StallPolicy
+    from linkstart.downloader._watchdog import Heartbeat, StallWatchdog
+
+    class _AbortAfter(StallPolicy):
+        poll_sec = 0.01
+
+        def __init__(self, n):
+            self.n = n
+            self.calls = 0
+
+        def should_abort(self, *, elapsed, bytes_written, since_growth):
+            self.calls += 1
+            return self.calls >= self.n
+
+    dl = Downloader()
+    out = tmp_path / "part00.ts"
+    (tmp_path / "part00.ts.part").write_bytes(b"x" * 1000)  # written once, never grows
+
+    hb = Heartbeat("twitcasting/Ao", dl.media, interval_sec=0.0)
+    with caplog.at_level(logging.INFO, logger="linkstart.downloader._watchdog"):
+        await asyncio.wait_for(
+            StallWatchdog(out, _AbortAfter(4), hb).watch(), timeout=2.0
+        )
+
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("no growth" in m for m in msgs), msgs
+
+
+async def test_watchdog_heartbeat_ffprobe_cannot_wedge_abort(tmp_path, monkeypatch):
+    """The best-effort content-duration ffprobe in the heartbeat must be time
+    bounded: a hung ffprobe must NOT block the watchdog's abort decision (which
+    would re-create the exact wedge the watchdog exists to prevent)."""
+    from linkstart.downloader._stall import StallPolicy
+    from linkstart.downloader._watchdog import Heartbeat, StallWatchdog
+
+    class _AbortAfter(StallPolicy):
+        poll_sec = 0.01
+
+        def __init__(self, n):
+            self.n = n
+            self.calls = 0
+
+        def should_abort(self, *, elapsed, bytes_written, since_growth):
+            self.calls += 1
+            return self.calls >= self.n
+
+    dl = Downloader()
+    out = tmp_path / "part00.ts"
+    (tmp_path / "part00.ts.part").write_bytes(b"x" * 2000)
+
+    async def hanging_ffprobe(path):
+        await asyncio.Event().wait()  # never returns
+
+    monkeypatch.setattr(dl.media, "ffprobe_duration", hanging_ffprobe)
+
+    hb = Heartbeat("twitcasting/Ao [edge]", dl.media, interval_sec=0.0,
+                   probe_timeout_sec=0.05)
+    # Must still abort (return) despite the hung probe — no infinite wedge.
+    await asyncio.wait_for(
+        StallWatchdog(out, _AbortAfter(2), hb).watch(), timeout=2.0
+    )
+
+
+async def test_watchdog_heartbeat_includes_content_duration(tmp_path, caplog, monkeypatch):
+    """Besides byte size, the heartbeat reports the recorded content length
+    (via ffprobe, best-effort) so it's visible how much footage exists / whether
+    a from-start loop has caught up to live."""
+    from linkstart.downloader._stall import StallPolicy
+    from linkstart.downloader._watchdog import Heartbeat, StallWatchdog
+
+    class _AbortAfter(StallPolicy):
+        poll_sec = 0.01
+
+        def __init__(self, n):
+            self.n = n
+            self.calls = 0
+
+        def should_abort(self, *, elapsed, bytes_written, since_growth):
+            self.calls += 1
+            return self.calls >= self.n
+
+    dl = Downloader()
+    out = tmp_path / "part00.ts"
+    (tmp_path / "part00.ts.part").write_bytes(b"x" * 2000)
+
+    async def fake_duration(path):
+        return 754  # 12.6 min of content
+
+    monkeypatch.setattr(dl.media, "ffprobe_duration", fake_duration)
+
+    hb = Heartbeat("twitcasting/Ao [edge]", dl.media, interval_sec=0.0)
+    with caplog.at_level(logging.INFO, logger="linkstart.downloader._watchdog"):
+        await asyncio.wait_for(
+            StallWatchdog(out, _AbortAfter(2), hb).watch(), timeout=2.0
+        )
+
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("13min content" in m for m in msgs), msgs
+
+
+async def test_run_proc_with_stop_kills_grandchild_after_parent_exits(tmp_path):
+    """Bug: yt-dlp (the direct child / group leader) can die FIRST, leaving
+    ffmpeg (grandchild) alive and holding the stderr pipe. Resolving the group
+    via os.getpgid(proc.pid) then fails (the leader is gone), so the grandchild
+    is never killed and communicate() never sees EOF. Killing by the pgid
+    captured at spawn reaps the surviving group member regardless.
+    """
+    import os
+    import sys
+
+    dl = Downloader()
+    pidfile = tmp_path / "gpid.txt"
+    gc_code = (
+        f"import os,time; open({str(pidfile)!r},'w').write(str(os.getpid())); "
+        "time.sleep(30)"
+    )
+    parent_code = (
+        "import sys,subprocess;"
+        f"subprocess.Popen([sys.executable,'-c',{gc_code!r}]);"
+        "sys.exit(0)"  # parent (group leader) exits immediately
+    )
+    args = [sys.executable, "-c", parent_code]
+    stop = asyncio.Event()
+
+    task = asyncio.create_task(
+        dl.run_attempt(args, stop, stall_policy=NeverAbortStallPolicy())
+    )
+    for _ in range(100):  # wait until the grandchild has spawned + recorded its pid
+        await asyncio.sleep(0.05)
+        if pidfile.exists() and pidfile.read_text().strip():
+            break
+    gpid = int(pidfile.read_text().strip())
+    stop.set()
+    await asyncio.wait_for(task, timeout=8.0)
+
+    await asyncio.sleep(0.3)
+    with pytest.raises(ProcessLookupError):
+        os.kill(gpid, 0)  # grandchild must be dead
+
+
+class _CommHangsProc:
+    """A subprocess whose stderr never reaches EOF (mimics yt-dlp's ffmpeg
+    grandchild holding the captured pipe open) — communicate() never returns,
+    even after the process is signalled."""
+
+    def __init__(self):
+        self.returncode = None
+        self.terminate_called = False
+        self.kill_called = False
+        self._dead = asyncio.Event()
+
+    async def communicate(self):
+        await asyncio.Event().wait()  # never completes
+
+    def terminate(self):
+        self.terminate_called = True
+        if self.returncode is None:
+            self.returncode = -15
+        self._dead.set()
+
+    def kill(self):
+        self.kill_called = True
+        self.returncode = -9
+        self._dead.set()
+
+    async def wait(self):
+        await self._dead.wait()
+        return self.returncode
+
+
+async def test_run_proc_with_stop_gives_up_cleanly_when_pipe_never_eofs():
+    """Bug: the teardown cancelled comm_task via wait_for, then re-awaited the
+    now-cancelled task — which raises CancelledError (not TimeoutError), escapes
+    the handler, and poisons the worker's TaskGroup. The teardown must instead
+    bound its waits and return cleanly (empty stderr) without raising."""
+    dl = Downloader()
+    dl.process.TEARDOWN_TERM_WAIT_SEC = 0.05  # force both escalation waits to time out fast
+    proc = _CommHangsProc()
+
+    async def fake_exec(*args, **kwargs):
+        return proc
+
+    stop = asyncio.Event()
+    stop.set()
+    with patch(
+        "linkstart.downloader._process.asyncio.create_subprocess_exec",
+        new=AsyncMock(side_effect=fake_exec),
+    ):
+        returncode, stderr, stalled = await asyncio.wait_for(
+            dl.run_attempt(
+                ["yt-dlp"], stop, stall_policy=NeverAbortStallPolicy()
+            ),
+            timeout=2.0
+        )
+
+    assert stderr == b""  # gave up on stderr rather than wedging — no exception
+    assert proc.terminate_called and proc.kill_called  # escalated SIGTERM → SIGKILL
+
+
 async def test_edge_only_stop_event_after_natural_exit_does_not_skip_remux(channel, live, tmp_path):
     """If yt-dlp exits naturally (broadcast ended) BEFORE stop_event fires,
     cleanup still happens normally. Stop signal must not break the cleanup path."""
@@ -1231,9 +1721,9 @@ async def test_edge_only_stop_event_after_natural_exit_does_not_skip_remux(chann
         target.write_bytes(b"final")
         return True
 
-    with patch.object(dl, "_remux_ts_to_mp4", new=AsyncMock(side_effect=fake_remux)):
+    with patch.object(dl.media, "remux", new=AsyncMock(side_effect=fake_remux)):
         with patch(
-            "linkstart.downloader._base.asyncio.create_subprocess_exec",
+            "linkstart.downloader._process.asyncio.create_subprocess_exec",
             new=AsyncMock(side_effect=fake_exec),
         ):
             result = await dl.record(channel, plat, live, stop_event=stop_event)
@@ -1258,12 +1748,12 @@ async def test_dual_breaks_both_loops_and_runs_cleanup_when_stop_signaled(channe
         Path(args[out_idx + 1]).write_bytes(b"data")
         return proc
 
-    async def fake_cleanup(channel, live, parts_dir, *, retry_count, full_restarted=False):
+    async def fake_cleanup(paths, media, channel, live, parts_dir, *, retry_count, full_restarted=False):
         return DownloadResult(success=True)
 
-    with patch.object(dl, "_cleanup_dual", new=AsyncMock(side_effect=fake_cleanup)):
+    with patch("linkstart.downloader._dual.cleanup_dual", new=AsyncMock(side_effect=fake_cleanup)):
         with patch(
-            "linkstart.downloader._base.asyncio.create_subprocess_exec",
+            "linkstart.downloader._process.asyncio.create_subprocess_exec",
             new=AsyncMock(side_effect=fake_exec),
         ):
             task = asyncio.create_task(
@@ -1299,9 +1789,9 @@ async def test_dual_terminates_procs_on_external_cancellation(channel, live, tmp
     async def fake_cleanup(*a, **kw):
         return DownloadResult(success=False)
 
-    with patch.object(dl, "_cleanup_dual", new=AsyncMock(side_effect=fake_cleanup)):
+    with patch("linkstart.downloader._dual.cleanup_dual", new=AsyncMock(side_effect=fake_cleanup)):
         with patch(
-            "linkstart.downloader._base.asyncio.create_subprocess_exec",
+            "linkstart.downloader._process.asyncio.create_subprocess_exec",
             new=AsyncMock(side_effect=fake_exec),
         ):
             task = asyncio.create_task(dl.record(channel, plat, live))
@@ -1352,9 +1842,9 @@ async def test_dual_terminates_sibling_proc_on_unhandled_error(channel, live, tm
     async def fake_cleanup(*a, **kw):
         return DownloadResult(success=False)
 
-    with patch.object(dl, "_cleanup_dual", new=AsyncMock(side_effect=fake_cleanup)):
+    with patch("linkstart.downloader._dual.cleanup_dual", new=AsyncMock(side_effect=fake_cleanup)):
         with patch(
-            "linkstart.downloader._base.asyncio.create_subprocess_exec",
+            "linkstart.downloader._process.asyncio.create_subprocess_exec",
             new=AsyncMock(side_effect=fake_exec),
         ):
             task = asyncio.create_task(dl.record(channel, plat, live))
@@ -1391,15 +1881,15 @@ async def test_cleanup_picks_longest_full_as_base(channel, live, tmp_path,
     async def fake_ffprobe(path):
         return durations.get(path)
 
-    monkeypatch.setattr(dl, "_ffprobe_duration", fake_ffprobe)
+    monkeypatch.setattr(dl.media, "ffprobe_duration", fake_ffprobe)
 
     # Mock fragment recovery to return nothing.
     async def fake_recover(*args, **kwargs):
         return []
-    monkeypatch.setattr(dl, "_recover_fragments", fake_recover)
+    monkeypatch.setattr("linkstart.downloader._cleanup._recover_fragments", fake_recover)
 
     # No edge files in this test
-    result = await dl._cleanup_dual(channel, live, parts_dir, retry_count=1)
+    result = await cleanup_dual(dl.paths, dl.media, channel, live, parts_dir, retry_count=1)
 
     assert result.success is True
     assert result.duration_sec == 30
@@ -1426,10 +1916,10 @@ async def test_cleanup_deletes_contained_edge(channel, live, tmp_path,
     async def fake_recover(*args, **kwargs):
         return []
 
-    monkeypatch.setattr(dl, "_ffprobe_duration", fake_ffprobe)
-    monkeypatch.setattr(dl, "_recover_fragments", fake_recover)
+    monkeypatch.setattr(dl.media, "ffprobe_duration", fake_ffprobe)
+    monkeypatch.setattr("linkstart.downloader._cleanup._recover_fragments", fake_recover)
 
-    result = await dl._cleanup_dual(channel, live, parts_dir, retry_count=0)
+    result = await cleanup_dual(dl.paths, dl.media, channel, live, parts_dir, retry_count=0)
 
     assert result.success is True
     assert result.extra_files == []   # edge was contained → deleted
@@ -1452,10 +1942,10 @@ async def test_cleanup_keeps_edge_with_tail(channel, live, tmp_path,
     async def fake_recover(*args, **kwargs):
         return []
 
-    monkeypatch.setattr(dl, "_ffprobe_duration", fake_ffprobe)
-    monkeypatch.setattr(dl, "_recover_fragments", fake_recover)
+    monkeypatch.setattr(dl.media, "ffprobe_duration", fake_ffprobe)
+    monkeypatch.setattr("linkstart.downloader._cleanup._recover_fragments", fake_recover)
 
-    result = await dl._cleanup_dual(channel, live, parts_dir, retry_count=0)
+    result = await cleanup_dual(dl.paths, dl.media, channel, live, parts_dir, retry_count=0)
 
     assert result.success is True
     assert len(result.extra_files) == 1
@@ -1517,10 +2007,10 @@ async def test_cleanup_skips_yt_dlp_intermediate_format_files_when_picking_base(
     async def fake_recover(*a, **kw):
         return []
 
-    monkeypatch.setattr(dl, "_ffprobe_duration", fake_ffprobe)
-    monkeypatch.setattr(dl, "_recover_fragments", fake_recover)
+    monkeypatch.setattr(dl.media, "ffprobe_duration", fake_ffprobe)
+    monkeypatch.setattr("linkstart.downloader._cleanup._recover_fragments", fake_recover)
 
-    result = await dl._cleanup_dual(channel, live, parts_dir, retry_count=0)
+    result = await cleanup_dual(dl.paths, dl.media, channel, live, parts_dir, retry_count=0)
     # base must be `full.1000.mp4` (parseable epoch), not the intermediate one.
     assert result.success is True
     assert result.file_path is not None
@@ -1545,14 +2035,14 @@ async def test_recover_fragments_pairs_complete_audio_with_part_video(tmp_path, 
         target.write_bytes(b"remuxed")
         return True
 
-    monkeypatch.setattr(dl, "_ffprobe_duration", fake_ffprobe)
-    monkeypatch.setattr(dl, "_ffmpeg_remux", fake_remux)
+    monkeypatch.setattr(dl.media, "ffprobe_duration", fake_ffprobe)
+    monkeypatch.setattr(dl.media, "ffmpeg_remux", fake_remux)
 
     import os
     os.utime(video, (1700000000, 1700000000))
 
     base_final = tmp_path / "base.mp4"
-    extras = await dl._recover_fragments(parts_dir, base_final, covered=[])
+    extras = await _cleanup_recover_fragments(dl.media, parts_dir, base_final, covered=[])
     assert len(extras) == 1
     assert extras[0].name.endswith(".recovered_001.mp4")
 
@@ -1577,13 +2067,13 @@ async def test_cleanup_no_base_recovers_fragments_when_only_intermediates_exist(
         target.write_bytes(b"remuxed")
         return True
 
-    monkeypatch.setattr(dl, "_ffprobe_duration", fake_ffprobe)
-    monkeypatch.setattr(dl, "_ffmpeg_remux", fake_remux)
+    monkeypatch.setattr(dl.media, "ffprobe_duration", fake_ffprobe)
+    monkeypatch.setattr(dl.media, "ffmpeg_remux", fake_remux)
 
     import os
     os.utime(video, (1700000000, 1700000000))
 
-    result = await dl._cleanup_dual(channel, live, parts_dir, retry_count=0)
+    result = await cleanup_dual(dl.paths, dl.media, channel, live, parts_dir, retry_count=0)
     assert result.success is True
     assert result.file_path is not None
     assert result.file_path.exists()
@@ -1610,10 +2100,10 @@ async def test_cleanup_keeps_edge_when_base_died_early(channel, live, tmp_path,
     async def fake_recover(*args, **kwargs):
         return []
 
-    monkeypatch.setattr(dl, "_ffprobe_duration", fake_ffprobe)
-    monkeypatch.setattr(dl, "_recover_fragments", fake_recover)
+    monkeypatch.setattr(dl.media, "ffprobe_duration", fake_ffprobe)
+    monkeypatch.setattr("linkstart.downloader._cleanup._recover_fragments", fake_recover)
 
-    result = await dl._cleanup_dual(channel, live, parts_dir, retry_count=0)
+    result = await cleanup_dual(dl.paths, dl.media, channel, live, parts_dir, retry_count=0)
 
     assert result.success is True
     # Both edges contain unique coverage; both preserved.
@@ -1642,10 +2132,10 @@ async def test_cleanup_drops_edge_with_subthreshold_new_coverage(channel, live,
     async def fake_recover(*args, **kwargs):
         return []
 
-    monkeypatch.setattr(dl, "_ffprobe_duration", fake_ffprobe)
-    monkeypatch.setattr(dl, "_recover_fragments", fake_recover)
+    monkeypatch.setattr(dl.media, "ffprobe_duration", fake_ffprobe)
+    monkeypatch.setattr("linkstart.downloader._cleanup._recover_fragments", fake_recover)
 
-    result = await dl._cleanup_dual(channel, live, parts_dir, retry_count=0)
+    result = await cleanup_dual(dl.paths, dl.media, channel, live, parts_dir, retry_count=0)
     assert result.success is True
     assert result.extra_files == []   # 3s tail < 5s threshold
 
@@ -1670,10 +2160,10 @@ async def test_cleanup_chains_coverage_across_edges(channel, live, tmp_path,
     async def fake_recover(*args, **kwargs):
         return []
 
-    monkeypatch.setattr(dl, "_ffprobe_duration", fake_ffprobe)
-    monkeypatch.setattr(dl, "_recover_fragments", fake_recover)
+    monkeypatch.setattr(dl.media, "ffprobe_duration", fake_ffprobe)
+    monkeypatch.setattr("linkstart.downloader._cleanup._recover_fragments", fake_recover)
 
-    result = await dl._cleanup_dual(channel, live, parts_dir, retry_count=0)
+    result = await cleanup_dual(dl.paths, dl.media, channel, live, parts_dir, retry_count=0)
     assert result.success is True
     assert len(result.extra_files) == 1
     assert result.extra_files[0].name.endswith(".edge_001.mp4")
@@ -1697,10 +2187,10 @@ async def test_cleanup_no_base_uses_edge_fallback(channel, live, tmp_path,
     async def fake_recover(*args, **kwargs):
         return []
 
-    monkeypatch.setattr(dl, "_ffprobe_duration", fake_ffprobe)
-    monkeypatch.setattr(dl, "_recover_fragments", fake_recover)
+    monkeypatch.setattr(dl.media, "ffprobe_duration", fake_ffprobe)
+    monkeypatch.setattr("linkstart.downloader._cleanup._recover_fragments", fake_recover)
 
-    result = await dl._cleanup_dual(channel, live, parts_dir, retry_count=0)
+    result = await cleanup_dual(dl.paths, dl.media, channel, live, parts_dir, retry_count=0)
 
     # Fallback: first edge becomes base, rest become extras.
     assert result.success is True
@@ -1730,11 +2220,11 @@ async def test_cleanup_keeps_contained_edge_when_full_restarted(channel, live, t
     async def fake_recover(*args, **kwargs):
         return []
 
-    monkeypatch.setattr(dl, "_ffprobe_duration", fake_ffprobe)
-    monkeypatch.setattr(dl, "_recover_fragments", fake_recover)
+    monkeypatch.setattr(dl.media, "ffprobe_duration", fake_ffprobe)
+    monkeypatch.setattr("linkstart.downloader._cleanup._recover_fragments", fake_recover)
 
-    result = await dl._cleanup_dual(
-        channel, live, parts_dir, retry_count=1, full_restarted=True
+    result = await cleanup_dual(
+        dl.paths, dl.media, channel, live, parts_dir, retry_count=1, full_restarted=True
     )
 
     assert result.success is True
@@ -1754,13 +2244,13 @@ async def test_dual_passes_full_restarted_true_to_cleanup(channel, live, tmp_pat
         Path(args[out_idx + 1]).write_bytes(b"data")
         return FakeProc(returncode=0)
 
-    async def fake_cleanup(channel, live, parts_dir, *, retry_count, full_restarted):
+    async def fake_cleanup(paths, media, channel, live, parts_dir, *, retry_count, full_restarted):
         captured["full_restarted"] = full_restarted
         return DownloadResult(success=False)
 
-    with patch.object(dl, "_cleanup_dual", new=AsyncMock(side_effect=fake_cleanup)):
+    with patch("linkstart.downloader._dual.cleanup_dual", new=AsyncMock(side_effect=fake_cleanup)):
         with patch(
-            "linkstart.downloader._base.asyncio.create_subprocess_exec",
+            "linkstart.downloader._process.asyncio.create_subprocess_exec",
             new=AsyncMock(side_effect=fake_exec),
         ):
             await dl.record(channel, plat, live)
@@ -1778,13 +2268,13 @@ async def test_dual_passes_full_restarted_false_without_restart(channel, live, t
         Path(args[out_idx + 1]).write_bytes(b"data")
         return FakeProc(returncode=0)
 
-    async def fake_cleanup(channel, live, parts_dir, *, retry_count, full_restarted):
+    async def fake_cleanup(paths, media, channel, live, parts_dir, *, retry_count, full_restarted):
         captured["full_restarted"] = full_restarted
         return DownloadResult(success=False)
 
-    with patch.object(dl, "_cleanup_dual", new=AsyncMock(side_effect=fake_cleanup)):
+    with patch("linkstart.downloader._dual.cleanup_dual", new=AsyncMock(side_effect=fake_cleanup)):
         with patch(
-            "linkstart.downloader._base.asyncio.create_subprocess_exec",
+            "linkstart.downloader._process.asyncio.create_subprocess_exec",
             new=AsyncMock(side_effect=fake_exec),
         ):
             await dl.record(channel, plat, live)
@@ -1823,11 +2313,11 @@ async def test_cleanup_uses_started_at_for_base_interval_when_full_restarted(
     async def fake_recover(*args, **kwargs):
         return []
 
-    monkeypatch.setattr(dl, "_ffprobe_duration", fake_ffprobe)
-    monkeypatch.setattr(dl, "_recover_fragments", fake_recover)
+    monkeypatch.setattr(dl.media, "ffprobe_duration", fake_ffprobe)
+    monkeypatch.setattr("linkstart.downloader._cleanup._recover_fragments", fake_recover)
 
-    result = await dl._cleanup_dual(
-        channel, live, parts_dir, retry_count=1, full_restarted=True
+    result = await cleanup_dual(
+        dl.paths, dl.media, channel, live, parts_dir, retry_count=1, full_restarted=True
     )
 
     assert result.success is True
@@ -1851,13 +2341,13 @@ async def test_recover_fragments_skips_contained(tmp_path, monkeypatch):
     async def fake_ffprobe(path):
         return 60
 
-    monkeypatch.setattr(dl, "_ffprobe_duration", fake_ffprobe)
+    monkeypatch.setattr(dl.media, "ffprobe_duration", fake_ffprobe)
     # Force "epoch" via stat mtime: use a deterministic mtime
     import os
     os.utime(v, (1000, 1000))
 
     base_final = tmp_path / "base.mp4"
-    extras = await dl._recover_fragments(parts_dir, base_final, covered=[(0, 2000)])
+    extras = await _cleanup_recover_fragments(dl.media, parts_dir, base_final, covered=[(0, 2000)])
 
     assert extras == []   # contained → no extras
 
@@ -1873,21 +2363,21 @@ async def test_recover_fragments_remuxes_uncovered(tmp_path, monkeypatch):
     async def fake_ffprobe(path):
         return 300   # 5 minutes — extends past base_end
 
-    monkeypatch.setattr(dl, "_ffprobe_duration", fake_ffprobe)
+    monkeypatch.setattr(dl.media, "ffprobe_duration", fake_ffprobe)
 
     # Mock ffmpeg remux: write the target file and return True.
     async def fake_remux(video, audio, target):
         target.write_bytes(b"remuxed")
         return True
 
-    monkeypatch.setattr(dl, "_ffmpeg_remux", fake_remux)
+    monkeypatch.setattr(dl.media, "ffmpeg_remux", fake_remux)
 
     import os
     os.utime(v, (1000, 1000))
 
     base_final = tmp_path / "base.mp4"
     base_final.write_bytes(b"")
-    extras = await dl._recover_fragments(parts_dir, base_final, covered=[(0, 100)])
+    extras = await _cleanup_recover_fragments(dl.media, parts_dir, base_final, covered=[(0, 100)])
 
     assert len(extras) == 1
     assert extras[0].name.endswith(".recovered_001.mp4")
@@ -1908,7 +2398,7 @@ async def test_recover_fragments_skips_groups_of_wrong_size(tmp_path, monkeypatc
     (parts_dir / "trio.f250.mp4.part").write_bytes(b"x")
 
     base_final = tmp_path / "base.mp4"
-    extras = await dl._recover_fragments(parts_dir, base_final, covered=[])
+    extras = await _cleanup_recover_fragments(dl.media, parts_dir, base_final, covered=[])
     assert extras == []
 
 
@@ -1927,14 +2417,14 @@ async def test_recover_fragments_remux_failure_yields_no_extra(tmp_path,
     async def fake_remux(video, audio, target):
         return False
 
-    monkeypatch.setattr(dl, "_ffprobe_duration", fake_ffprobe)
-    monkeypatch.setattr(dl, "_ffmpeg_remux", fake_remux)
+    monkeypatch.setattr(dl.media, "ffprobe_duration", fake_ffprobe)
+    monkeypatch.setattr(dl.media, "ffmpeg_remux", fake_remux)
 
     import os
     os.utime(v, (1000, 1000))
 
     base_final = tmp_path / "base.mp4"
-    extras = await dl._recover_fragments(parts_dir, base_final, covered=[(0, 100)])
+    extras = await _cleanup_recover_fragments(dl.media, parts_dir, base_final, covered=[(0, 100)])
     assert extras == []
 
 
@@ -1949,11 +2439,11 @@ async def test_ffprobe_duration_parses_stdout(tmp_path):
         captured["capture_stdout"] = capture_stdout
         return 0, b"123.456\n", b""
 
-    with patch.object(dl, "_run_proc", side_effect=fake_run):
-        d = await dl._ffprobe_duration(tmp_path / "x.mp4")
+    with patch.object(dl.process, "run", side_effect=fake_run):
+        d = await dl.media.ffprobe_duration(tmp_path / "x.mp4")
     assert d == 123
     assert captured["capture_stdout"] is True
-    assert dl.ffprobe_bin in captured["args"]
+    assert dl.media.ffprobe_bin in captured["args"]
     assert str(tmp_path / "x.mp4") in captured["args"]
 
 
@@ -1963,8 +2453,8 @@ async def test_ffprobe_duration_returncode_nonzero_returns_none(tmp_path):
     async def fake_run(args, *, capture_stdout=False):
         return 1, b"", b"err"
 
-    with patch.object(dl, "_run_proc", side_effect=fake_run):
-        assert await dl._ffprobe_duration(tmp_path / "x.mp4") is None
+    with patch.object(dl.process, "run", side_effect=fake_run):
+        assert await dl.media.ffprobe_duration(tmp_path / "x.mp4") is None
 
 
 async def test_ffprobe_duration_empty_stdout_returns_none(tmp_path):
@@ -1973,8 +2463,8 @@ async def test_ffprobe_duration_empty_stdout_returns_none(tmp_path):
     async def fake_run(args, *, capture_stdout=False):
         return 0, b"   \n", b""
 
-    with patch.object(dl, "_run_proc", side_effect=fake_run):
-        assert await dl._ffprobe_duration(tmp_path / "x.mp4") is None
+    with patch.object(dl.process, "run", side_effect=fake_run):
+        assert await dl.media.ffprobe_duration(tmp_path / "x.mp4") is None
 
 
 async def test_ffprobe_duration_unparseable_stdout_returns_none(tmp_path):
@@ -1983,8 +2473,8 @@ async def test_ffprobe_duration_unparseable_stdout_returns_none(tmp_path):
     async def fake_run(args, *, capture_stdout=False):
         return 0, b"not-a-float\n", b""
 
-    with patch.object(dl, "_run_proc", side_effect=fake_run):
-        assert await dl._ffprobe_duration(tmp_path / "x.mp4") is None
+    with patch.object(dl.process, "run", side_effect=fake_run):
+        assert await dl.media.ffprobe_duration(tmp_path / "x.mp4") is None
 
 
 async def test_ffprobe_duration_run_proc_raises_returns_none(tmp_path):
@@ -1993,8 +2483,8 @@ async def test_ffprobe_duration_run_proc_raises_returns_none(tmp_path):
     async def fake_run(args, *, capture_stdout=False):
         raise OSError("boom")
 
-    with patch.object(dl, "_run_proc", side_effect=fake_run):
-        assert await dl._ffprobe_duration(tmp_path / "x.mp4") is None
+    with patch.object(dl.process, "run", side_effect=fake_run):
+        assert await dl.media.ffprobe_duration(tmp_path / "x.mp4") is None
 
 
 async def test_ffmpeg_remux_success(tmp_path):
@@ -2008,10 +2498,10 @@ async def test_ffmpeg_remux_success(tmp_path):
     v = tmp_path / "v.part"
     a = tmp_path / "a.part"
     t = tmp_path / "out.mp4"
-    with patch.object(dl, "_run_proc", side_effect=fake_run):
-        ok = await dl._ffmpeg_remux(v, a, t)
+    with patch.object(dl.process, "run", side_effect=fake_run):
+        ok = await dl.media.ffmpeg_remux(v, a, t)
     assert ok is True
-    assert dl.ffmpeg_bin in captured["args"]
+    assert dl.media.ffmpeg_bin in captured["args"]
     assert str(v) in captured["args"]
     assert str(a) in captured["args"]
     assert str(t) in captured["args"]
@@ -2023,8 +2513,8 @@ async def test_ffmpeg_remux_nonzero_returns_false(tmp_path):
     async def fake_run(args, *, capture_stdout=False):
         return 1, b"", b"fail"
 
-    with patch.object(dl, "_run_proc", side_effect=fake_run):
-        ok = await dl._ffmpeg_remux(tmp_path / "v", tmp_path / "a", tmp_path / "t")
+    with patch.object(dl.process, "run", side_effect=fake_run):
+        ok = await dl.media.ffmpeg_remux(tmp_path / "v", tmp_path / "a", tmp_path / "t")
     assert ok is False
 
 
@@ -2034,8 +2524,8 @@ async def test_ffmpeg_remux_run_proc_raises_returns_false(tmp_path):
     async def fake_run(args, *, capture_stdout=False):
         raise OSError("boom")
 
-    with patch.object(dl, "_run_proc", side_effect=fake_run):
-        ok = await dl._ffmpeg_remux(tmp_path / "v", tmp_path / "a", tmp_path / "t")
+    with patch.object(dl.process, "run", side_effect=fake_run):
+        ok = await dl.media.ffmpeg_remux(tmp_path / "v", tmp_path / "a", tmp_path / "t")
     assert ok is False
 
 
@@ -2049,8 +2539,8 @@ async def test_remux_ts_to_mp4_success(tmp_path):
 
     final = tmp_path / "final.mp4"
     part = tmp_path / "p0.ts"
-    with patch.object(dl, "_run_proc", side_effect=fake_run):
-        ok = await dl._remux_ts_to_mp4(part, final)
+    with patch.object(dl.process, "run", side_effect=fake_run):
+        ok = await dl.media.remux(part, final)
     assert ok is True
     # Remux is a copy operation, not concat.
     assert "concat" not in captured["args"]
@@ -2068,8 +2558,8 @@ async def test_remux_ts_to_mp4_failure(tmp_path):
 
     part = tmp_path / "p0.ts"
     final = tmp_path / "final.mp4"
-    with patch.object(dl, "_run_proc", side_effect=fake_run):
-        assert await dl._remux_ts_to_mp4(part, final) is False
+    with patch.object(dl.process, "run", side_effect=fake_run):
+        assert await dl.media.remux(part, final) is False
 
 
 # --- _cleanup_dual algorithm edge cases ---
@@ -2087,9 +2577,9 @@ async def test_cleanup_dual_unparseable_base_epoch_is_skipped(channel, live, tmp
     async def fake_ffprobe(path):
         return 10
 
-    monkeypatch.setattr(dl, "_ffprobe_duration", fake_ffprobe)
+    monkeypatch.setattr(dl.media, "ffprobe_duration", fake_ffprobe)
 
-    result = await dl._cleanup_dual(channel, live, parts_dir, retry_count=0)
+    result = await cleanup_dual(dl.paths, dl.media, channel, live, parts_dir, retry_count=0)
     assert result.success is False
     assert "no usable recordings produced" in (result.error or "")
 
@@ -2112,10 +2602,10 @@ async def test_cleanup_dual_edge_with_unparseable_epoch_is_skipped(channel, live
     async def fake_recover(*a, **kw):
         return []
 
-    monkeypatch.setattr(dl, "_ffprobe_duration", fake_ffprobe)
-    monkeypatch.setattr(dl, "_recover_fragments", fake_recover)
+    monkeypatch.setattr(dl.media, "ffprobe_duration", fake_ffprobe)
+    monkeypatch.setattr("linkstart.downloader._cleanup._recover_fragments", fake_recover)
 
-    result = await dl._cleanup_dual(channel, live, parts_dir, retry_count=0)
+    result = await cleanup_dual(dl.paths, dl.media, channel, live, parts_dir, retry_count=0)
     assert result.success is True
     # Unparseable edge file should not appear as an extra.
     assert result.extra_files == []
@@ -2137,10 +2627,10 @@ async def test_cleanup_dual_edge_ffprobe_none_is_kept(channel, live, tmp_path, m
     async def fake_recover(*a, **kw):
         return []
 
-    monkeypatch.setattr(dl, "_ffprobe_duration", fake_ffprobe)
-    monkeypatch.setattr(dl, "_recover_fragments", fake_recover)
+    monkeypatch.setattr(dl.media, "ffprobe_duration", fake_ffprobe)
+    monkeypatch.setattr("linkstart.downloader._cleanup._recover_fragments", fake_recover)
 
-    result = await dl._cleanup_dual(channel, live, parts_dir, retry_count=0)
+    result = await cleanup_dual(dl.paths, dl.media, channel, live, parts_dir, retry_count=0)
     assert result.success is True
     assert len(result.extra_files) == 1
     assert result.extra_files[0].name.endswith(".edge_001.mp4")
@@ -2153,7 +2643,7 @@ async def test_cleanup_no_base_empty_edge_files_returns_failure(channel, live, t
     parts_dir.mkdir()
     # No full.*.mp4 and no edge.*.mp4 → cleanup_no_base returns failure.
 
-    result = await dl._cleanup_dual(channel, live, parts_dir, retry_count=2)
+    result = await cleanup_dual(dl.paths, dl.media, channel, live, parts_dir, retry_count=2)
     assert result.success is False
     assert "no usable recordings produced" in (result.error or "")
     assert result.retry_count == 2
@@ -2173,15 +2663,15 @@ async def test_cleanup_dual_summary_append_failure_does_not_break_success(
     async def fake_recover(*a, **kw):
         return []
 
-    monkeypatch.setattr(dl, "_ffprobe_duration", fake_ffprobe)
-    monkeypatch.setattr(dl, "_recover_fragments", fake_recover)
+    monkeypatch.setattr(dl.media, "ffprobe_duration", fake_ffprobe)
+    monkeypatch.setattr("linkstart.downloader._cleanup._recover_fragments", fake_recover)
 
     def boom(**kw):
         raise RuntimeError("summary store broken")
 
     monkeypatch.setattr("linkstart.summary.append_recording_record", boom)
 
-    result = await dl._cleanup_dual(channel, live, parts_dir, retry_count=0)
+    result = await cleanup_dual(dl.paths, dl.media, channel, live, parts_dir, retry_count=0)
     assert result.success is True   # Summary failure is best-effort, does not affect success.
 
 
@@ -2196,14 +2686,14 @@ async def test_cleanup_no_base_summary_append_failure_does_not_break_success(
     async def fake_ffprobe(path):
         return 10
 
-    monkeypatch.setattr(dl, "_ffprobe_duration", fake_ffprobe)
+    monkeypatch.setattr(dl.media, "ffprobe_duration", fake_ffprobe)
 
     def boom(**kw):
         raise RuntimeError("summary store broken")
 
     monkeypatch.setattr("linkstart.summary.append_recording_record", boom)
 
-    result = await dl._cleanup_dual(channel, live, parts_dir, retry_count=0)
+    result = await cleanup_dual(dl.paths, dl.media, channel, live, parts_dir, retry_count=0)
     assert result.success is True
 
 
@@ -2227,9 +2717,9 @@ async def test_record_attaches_validation_from_platform(channel, live):
         target.write_bytes(b"final")
         return True
 
-    with patch.object(dl, "_remux_ts_to_mp4", new=AsyncMock(side_effect=fake_remux)):
+    with patch.object(dl.media, "remux", new=AsyncMock(side_effect=fake_remux)):
         with patch(
-            "linkstart.downloader._base.asyncio.create_subprocess_exec",
+            "linkstart.downloader._process.asyncio.create_subprocess_exec",
             new=AsyncMock(side_effect=fake_exec),
         ):
             result = await dl.record(channel, plat, live)
@@ -2254,7 +2744,7 @@ async def test_record_does_not_validate_on_failure(channel, live):
         return FakeProc(returncode=1)
 
     with patch(
-        "linkstart.downloader._base.asyncio.create_subprocess_exec",
+        "linkstart.downloader._process.asyncio.create_subprocess_exec",
         new=AsyncMock(side_effect=fake_exec),
     ):
         result = await dl.record(channel, plat, live)
@@ -2277,12 +2767,28 @@ async def test_record_default_validation_is_ok_for_unmodified_platform(channel, 
         target.write_bytes(b"final")
         return True
 
-    with patch.object(dl, "_remux_ts_to_mp4", new=AsyncMock(side_effect=fake_remux)):
+    with patch.object(dl.media, "remux", new=AsyncMock(side_effect=fake_remux)):
         with patch(
-            "linkstart.downloader._base.asyncio.create_subprocess_exec",
+            "linkstart.downloader._process.asyncio.create_subprocess_exec",
             new=AsyncMock(side_effect=fake_exec),
         ):
             result = await dl.record(channel, plat, live)
 
     assert result.success is True
     assert result.validation.status == "ok"
+
+
+async def test_cleanup_dual_no_base_returns_failure(tmp_path):
+    from linkstart.downloader._cleanup import cleanup_dual
+    from linkstart.downloader._paths import RecordingPaths
+    from linkstart.downloader._media import MediaTools
+    from linkstart.downloader._process import ProcessRunner
+    paths = RecordingPaths()
+    media = MediaTools(ProcessRunner())
+    parts = tmp_path / "x.parts"
+    parts.mkdir()
+    # no full.*.mp4, no edge.*.mp4, no fragments → no usable recording
+    channel = ChannelConfig(platform="fake", channel_id="abc", save_dir=tmp_path / "rec", poll_interval=0)
+    live = LiveInfo(live_id="100", title="hello", url="https://fake/abc")
+    result = await cleanup_dual(paths, media, channel, live, parts, retry_count=0)
+    assert result.success is False

@@ -321,6 +321,36 @@ async def test_failed_download_is_retried_on_next_poll(app_config, state, tmp_pa
     assert downloader.record.await_count == 2
 
 
+async def test_repeated_same_live_failures_back_off(app_config, state):
+    """A still-live broadcast that keeps failing must not be re-attempted on
+    every poll forever. The first retry is free; after that, the backoff policy
+    blocks further immediate attempts within the (fast-test) time window."""
+    live = LiveInfo(live_id="999", title="t", url="https://x")
+    plat = FakePlatform(results=[live, live, live])
+    downloader = MagicMock()
+    downloader.record = AsyncMock(
+        return_value=DownloadResult(success=False, error="stall")
+    )
+    notifier = RecordingNotifier()
+
+    orch = Orchestrator(
+        config=app_config,
+        platforms={"twitcasting": plat},
+        notifiers={"main": notifier},
+        downloader=downloader,
+        state=state,
+    )
+
+    async def stop_soon():
+        await asyncio.sleep(0.1)
+        orch.stop()
+
+    await asyncio.gather(orch.run(), stop_soon())
+
+    # initial attempt + one free retry; the 3rd detection is held off by backoff.
+    assert downloader.record.await_count == 2
+
+
 async def test_live_started_notified_once_across_retries(app_config, state):
     """Retrying the same live (failure loop) must not spam LIVE_STARTED /
     DOWNLOAD_STARTED on every poll — announce each live_id once per process."""
@@ -559,6 +589,74 @@ async def test_check_live_exception_is_logged_and_loop_continues(app_config, sta
     assert plat.calls >= 1
     assert downloader.record.await_count == 0
     assert any("check_live raised unexpectedly" in r.message for r in caplog.records)
+
+
+async def test_worker_iteration_exception_does_not_kill_other_channels(
+    app_config, state, caplog
+):
+    """An unexpected exception in one channel's per-iteration body must NOT escape
+    to the TaskGroup (which would cancel every other channel's worker). It must be
+    logged, and that worker must keep polling so it self-heals."""
+    import logging
+
+    class AlwaysLivePlatform(Platform):
+        name = "twitcasting"
+
+        def __init__(self, live):
+            self._live = live
+            self.calls = 0
+
+        async def check_live(self, channel):
+            self.calls += 1
+            return self._live
+
+        def build_url(self, channel, live):
+            return "https://x"
+
+    class RaisingRetryPolicy:
+        """should_attempt raises every time — simulates an unexpected bug in the
+        per-iteration bookkeeping, not in check_live (which is already guarded)."""
+
+        def __init__(self):
+            self.calls = 0
+
+        def should_attempt(self, channel, live_id, *, now):
+            self.calls += 1
+            raise RuntimeError("unexpected per-iteration failure")
+
+        def record_success(self, *a, **k):
+            pass
+
+        def record_failure(self, *a, **k):
+            pass
+
+    live = LiveInfo(live_id="1", title="t", url="https://x")
+    plat = AlwaysLivePlatform(live)
+    downloader = MagicMock()
+    downloader.record = AsyncMock()
+    policy = RaisingRetryPolicy()
+
+    orch = Orchestrator(
+        config=app_config,
+        platforms={"twitcasting": plat},
+        notifiers={"main": RecordingNotifier()},
+        downloader=downloader,
+        state=state,
+        retry_policy=policy,
+    )
+
+    async def stop_soon():
+        await asyncio.sleep(0.05)
+        orch.stop()
+
+    # Must NOT raise: without isolation the RuntimeError propagates out of the
+    # worker, the TaskGroup cancels siblings, and run() raises an ExceptionGroup.
+    with caplog.at_level(logging.ERROR, logger="linkstart.orchestrator"):
+        await asyncio.gather(orch.run(), stop_soon())
+
+    # The worker kept polling across the repeated failure rather than dying once.
+    assert policy.calls >= 2
+    assert any("worker iteration failed" in r.message for r in caplog.records)
 
 
 async def test_wait_timeout_path_keeps_polling(tmp_path, state):
@@ -867,3 +965,59 @@ async def test_ok_validation_still_fires_download_finished(app_config, state, tm
     types = [e.type for e in notifier.events]
     assert EventType.DOWNLOAD_FINISHED in types
     assert EventType.ERROR not in types
+
+
+async def test_record_failure_timestamp_is_after_the_attempt(app_config, state, tmp_path):
+    """Backoff must be measured from when a failed attempt ENDED, not when it
+    started. The old code captured `now` once (before _record_live) and reused
+    it for record_failure, so a long-running failure consumed its own backoff
+    delay → the daemon re-attempts immediately, defeating the throttle."""
+    from linkstart.retry import LiveRetryPolicy
+
+    live = LiveInfo(live_id="999", title="t", url="https://x")
+    plat = FakePlatform(results=[live])
+
+    class SpyPolicy(LiveRetryPolicy):
+        def __init__(self):
+            self.attempt_now: list[float] = []
+            self.failure_now: list[float] = []
+
+        def should_attempt(self, channel, live_id, *, now):
+            self.attempt_now.append(now)
+            return True
+
+        def record_failure(self, channel, live_id, *, now):
+            self.failure_now.append(now)
+
+        def record_success(self, channel, live_id):
+            pass
+
+    spy = SpyPolicy()
+
+    async def slow_failing_record(*a, **k):
+        await asyncio.sleep(0.05)  # attempt takes real time → loop clock advances
+        return DownloadResult(success=False, error="boom")
+
+    downloader = MagicMock()
+    downloader.record = AsyncMock(side_effect=slow_failing_record)
+    notifier = RecordingNotifier()
+
+    orch = Orchestrator(
+        config=app_config,
+        platforms={"twitcasting": plat},
+        notifiers={"main": notifier},
+        downloader=downloader,
+        state=state,
+        retry_policy=spy,
+    )
+
+    async def stop_soon():
+        await asyncio.sleep(0.2)
+        orch.stop()
+
+    await asyncio.gather(orch.run(), stop_soon())
+
+    assert spy.attempt_now and spy.failure_now
+    # The failure must be timestamped after the ~0.05s attempt, not with the
+    # pre-attempt time.
+    assert spy.failure_now[0] > spy.attempt_now[0]

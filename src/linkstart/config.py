@@ -35,6 +35,7 @@ class RawChannel(BaseModel):
     save_dir: Path | None = None
     format: str | None = None
     alias: str | None = None
+    downloader: str | None = None
 
     _expand_save_dir = field_validator("save_dir", mode="before")(_expand_path)
 
@@ -71,4 +72,5 @@ def merge_channel(raw: RawChannel, defaults: Defaults) -> ChannelConfig:
         save_dir=raw.save_dir if raw.save_dir is not None else defaults.save_dir,
         format=raw.format,
         alias=raw.alias,
+        downloader=raw.downloader,
     )

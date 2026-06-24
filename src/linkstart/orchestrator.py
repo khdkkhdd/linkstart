@@ -15,14 +15,14 @@ from linkstart.models import (
 )
 from linkstart.notifier.base import Notifier
 from linkstart.platforms.base import Platform
+from linkstart.retry import ExponentialBackoffRetryPolicy, LiveRetryPolicy
 from linkstart.state import StateStore
 
 log = logging.getLogger(__name__)
 
 
 class ChannelNotifications:
-    """Per-channel notification policy: announce each live once, rate-limit
-    errors, never let a notifier failure reach the recording flow."""
+    """Per-channel notification policy: deduplicate live announcements and rate-limit error events."""
 
     def __init__(
         self,
@@ -99,12 +99,15 @@ class Orchestrator:
         notifiers: dict[str, Notifier],
         downloader: Downloader,
         state: StateStore,
+        retry_policy: LiveRetryPolicy | None = None,
     ) -> None:
         self.config = config
         self.platforms = platforms
         self.notifiers = notifiers
         self.downloader = downloader
         self.state = state
+        # Bounds re-recording of a still-live broadcast that keeps failing.
+        self._retry_policy = retry_policy or ExponentialBackoffRetryPolicy()
         self._stop = asyncio.Event()
 
     def stop(self) -> None:
@@ -140,11 +143,45 @@ class Orchestrator:
             "worker started for %s/%s", channel.platform, channel.log_name
         )
         while not self._stop.is_set():
-            live = await self._check_live(platform, channel)
-            if live is not None:
-                await self._record_live(channel, platform, notifications, live)
+            try:
+                await self._poll_once(platform, channel, notifications)
+            except Exception:
+                # Swallow so one channel's error doesn't cancel sibling workers.
+                log.exception(
+                    "worker iteration failed for %s/%s; continuing",
+                    channel.platform, channel.log_name,
+                )
             if await self._wait(channel.poll_interval):
                 return
+
+    async def _poll_once(
+        self,
+        platform: Platform,
+        channel: ChannelConfig,
+        notifications: ChannelNotifications,
+    ) -> None:
+        """One detect→record iteration for a channel."""
+        live = await self._check_live(platform, channel)
+        if live is None:
+            return
+        now = asyncio.get_running_loop().time()
+        if self._retry_policy.should_attempt(channel, live.live_id, now=now):
+            succeeded = await self._record_live(
+                channel, platform, notifications, live
+            )
+            if succeeded:
+                self._retry_policy.record_success(channel, live.live_id)
+            else:
+                # Timestamp after the attempt ends so elapsed recording time doesn't eat the backoff.
+                self._retry_policy.record_failure(
+                    channel, live.live_id,
+                    now=asyncio.get_running_loop().time(),
+                )
+        else:
+            log.info(
+                "backing off re-record: %s/%s id=%s (recent failures)",
+                channel.platform, channel.log_name, live.live_id,
+            )
 
     async def _check_live(
         self, platform: Platform, channel: ChannelConfig
@@ -161,7 +198,9 @@ class Orchestrator:
         platform: Platform,
         notifications: ChannelNotifications,
         live: LiveInfo,
-    ) -> None:
+    ) -> bool:
+        """Record the broadcast; return True only on a genuinely successful
+        capture (used to drive the retry/backoff policy)."""
         try:
             self.state.mark_seen(channel.platform, channel.channel_id, live.live_id)
         except Exception:
@@ -188,13 +227,11 @@ class Orchestrator:
         except Exception as e:
             log.exception("downloader raised")
             await notifications.error(live, str(e))
-            return
+            return False
 
         if result.success and result.validation.status == "invalid":
-            # yt-dlp produced a file but the platform flagged it as a
-            # silent failure (e.g. TwitCasting login-wall placeholder).
-            # Surface as an error so the operator can investigate; keep
-            # the file on disk for inspection rather than auto-deleting.
+            # yt-dlp produced a file but the platform flagged it as a silent
+            # failure (e.g. TwitCasting login-wall); surface it and keep the file.
             detail = (
                 f"{result.validation.reason} [file: {result.file_path}]"
                 if result.validation.reason
@@ -208,6 +245,9 @@ class Orchestrator:
                 live, detail,
                 file_path=result.file_path, retry_count=result.retry_count,
             )
+            # An invalid result (e.g. login wall) won't fix itself on an
+            # immediate retry — treat it as a failure so the backoff applies.
+            return False
         elif result.success:
             log.info(
                 "download finished: %s/%s file=%s size=%s duration=%ss retries=%s",
@@ -216,6 +256,7 @@ class Orchestrator:
                 result.retry_count,
             )
             await notifications.finished(live, result)
+            return True
         else:
             log.warning(
                 "download failed: %s/%s error=%s retries=%s",
@@ -223,6 +264,7 @@ class Orchestrator:
                 result.error, result.retry_count,
             )
             await notifications.error(live, result.error, retry_count=result.retry_count)
+            return False
 
     async def _wait(self, seconds: int) -> bool:
         """Return True if stop was requested during the wait."""

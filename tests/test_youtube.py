@@ -23,9 +23,11 @@ def test_youtube_default_format_set():
     assert p.default_format == "137+140/bestvideo+bestaudio/best"
 
 
-def test_youtube_yt_dlp_args_empty(channel):
+def test_youtube_download_profile_is_mp4_no_flags(channel):
     p = YoutubePlatform()
-    assert p.yt_dlp_args(channel) == []
+    profile = p.download_profile(channel)
+    assert profile.container == "mp4"
+    assert profile.to_yt_dlp_args() == []
 
 
 def test_build_url_handle(channel):

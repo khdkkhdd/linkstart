@@ -6,7 +6,12 @@ from pathlib import Path
 
 import aiohttp
 
-from linkstart.models import ChannelConfig, LiveInfo, ValidationResult
+from linkstart.models import (
+    ChannelConfig,
+    DownloadProfile,
+    LiveInfo,
+    ValidationResult,
+)
 from linkstart.platforms.base import Platform
 
 log = logging.getLogger(__name__)
@@ -85,13 +90,14 @@ class TwitcastingPlatform(Platform):
         )
 
     def build_url(self, channel: ChannelConfig, live: LiveInfo) -> str:
-        return f"https://twitcasting.tv/{channel.channel_id}"
+        # Pin yt-dlp to the known live_id: the bare channel URL can serve a
+        # stale "current movie" id across broadcast transitions (CDN caching).
+        return f"https://twitcasting.tv/{channel.channel_id}/movie/{live.live_id}"
 
-    def yt_dlp_args(self, channel: ChannelConfig) -> list[str]:
-        # --no-live-from-start is yt-dlp's default; no need to spell it out.
-        # The Downloader does not pass --live-from-start for TwitCasting
-        # because supports_live_from_start is False (inherited from base).
-        return ["--hls-use-mpegts"]
+    def _base_download_profile(self, channel: ChannelConfig) -> DownloadProfile:
+        # mpegts (.ts parts): stays playable even if the recorder is killed
+        # mid-write — important for long live captures.
+        return DownloadProfile(container="mpegts")
 
     async def validate_recording(self, file_path: Path) -> ValidationResult:
         metrics = await self._ffprobe_metrics(file_path)

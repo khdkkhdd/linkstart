@@ -34,10 +34,13 @@ def test_default_format_is_none():
     assert plat.default_format is None
 
 
-def test_default_yt_dlp_args_is_empty():
+def test_default_download_profile_is_mp4_auto():
     plat = _FakePlatform(results=[])
     ch = ChannelConfig(platform="fake", channel_id="abc")
-    assert plat.yt_dlp_args(ch) == []
+    profile = plat.download_profile(ch)
+    assert profile.container == "mp4"
+    assert profile.downloader == "auto"
+    assert profile.to_yt_dlp_args() == []
 
 
 async def test_is_still_live_true_when_same_id(channel):

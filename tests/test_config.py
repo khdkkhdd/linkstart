@@ -108,6 +108,24 @@ def test_merge_channel_propagates_format():
     assert merged.format == "137+140"
 
 
+def test_merge_channel_propagates_downloader():
+    app = AppConfig.model_validate({
+        "channels": [
+            {"platform": "twitcasting", "channel_id": "x", "downloader": "native"}
+        ]
+    })
+    merged = merge_channel(app.channels[0], app.defaults)
+    assert merged.downloader == "native"
+
+
+def test_merge_channel_downloader_defaults_to_none():
+    app = AppConfig.model_validate({
+        "channels": [{"platform": "twitcasting", "channel_id": "x"}]
+    })
+    merged = merge_channel(app.channels[0], app.defaults)
+    assert merged.downloader is None
+
+
 def test_save_dir_tilde_expanded_in_defaults():
     app = AppConfig.model_validate({
         "defaults": {"save_dir": "~/Downloads/LinkStart"},

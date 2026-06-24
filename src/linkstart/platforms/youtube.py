@@ -29,6 +29,10 @@ class YoutubePlatform(Platform):
     def __init__(self, yt_dlp_bin: str = "yt-dlp") -> None:
         self.yt_dlp_bin = yt_dlp_bin
 
+    def recording_strategy(self, ctx):
+        from linkstart.downloader._dual import DualRecordingStrategy
+        return DualRecordingStrategy(ctx)
+
     def build_url(self, channel: ChannelConfig, live: LiveInfo) -> str:
         return f"https://www.youtube.com/{channel.channel_id}/live"
 

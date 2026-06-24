@@ -31,17 +31,138 @@ def test_parser_config_default():
     assert args.config == Path("config.yaml")
 
 
-def test_log_level_env_override(monkeypatch):
+def test_log_level_env_override(monkeypatch, tmp_path):
     import logging
     from linkstart.cli import configure_logging
     monkeypatch.setenv("LINKSTART_LOG_LEVEL", "DEBUG")
-    # Reset existing root handlers so basicConfig re-applies level.
+    monkeypatch.setenv("LINKSTART_LOG_FILE", str(tmp_path / "ls.log"))  # keep ~ clean
     root = logging.getLogger()
-    for h in list(root.handlers):
+    saved = list(root.handlers)
+    for h in saved:
         root.removeHandler(h)
     root.setLevel(logging.WARNING)
-    configure_logging()
-    assert logging.getLogger().level == logging.DEBUG
+    try:
+        configure_logging()
+        assert logging.getLogger().level == logging.DEBUG
+    finally:
+        for h in list(root.handlers):
+            root.removeHandler(h)
+            try:
+                h.close()
+            except Exception:
+                pass
+        for h in saved:
+            root.addHandler(h)
+
+
+def test_configure_logging_writes_to_rotating_file(monkeypatch, tmp_path):
+    """Logging must land in a file automatically (independent of how the daemon
+    is launched), via a size-bounded RotatingFileHandler whose path is
+    configurable with LINKSTART_LOG_FILE."""
+    import logging
+    from logging.handlers import RotatingFileHandler
+    from linkstart.cli import configure_logging
+
+    log_file = tmp_path / "sub" / "linkstart.log"  # parent dir must be created
+    monkeypatch.setenv("LINKSTART_LOG_FILE", str(log_file))
+    root = logging.getLogger()
+    saved = list(root.handlers)
+    for h in saved:
+        root.removeHandler(h)
+    try:
+        configure_logging()
+        assert any(isinstance(h, RotatingFileHandler) for h in root.handlers)
+        logging.getLogger("linkstart.test").warning("hello-file-log")
+        for h in root.handlers:
+            h.flush()
+        assert log_file.exists()
+        assert "hello-file-log" in log_file.read_text()
+    finally:
+        for h in list(root.handlers):
+            root.removeHandler(h)
+            try:
+                h.close()
+            except Exception:
+                pass
+        for h in saved:
+            root.addHandler(h)
+
+
+def test_configure_logging_closes_old_file_handler_on_reinvoke(monkeypatch, tmp_path):
+    """Re-invoking configure_logging must close the previous RotatingFileHandler
+    (release its fd) and not accumulate handlers — otherwise a re-config leaks a
+    file descriptor each time."""
+    import logging
+    from logging.handlers import RotatingFileHandler
+    from linkstart.cli import configure_logging
+
+    monkeypatch.setenv("LINKSTART_LOG_FILE", str(tmp_path / "ls.log"))
+    root = logging.getLogger()
+    saved = list(root.handlers)
+    for h in saved:
+        root.removeHandler(h)
+    try:
+        configure_logging()
+        first = [h for h in root.handlers if isinstance(h, RotatingFileHandler)]
+        assert len(first) == 1
+        first_handler = first[0]
+
+        configure_logging()  # re-invoke
+        fhs = [h for h in root.handlers if isinstance(h, RotatingFileHandler)]
+        assert len(fhs) == 1                 # no accumulation
+        assert first_handler.stream is None  # previous handler was closed (fd freed)
+    finally:
+        for h in list(root.handlers):
+            root.removeHandler(h)
+            try:
+                h.close()
+            except Exception:
+                pass
+        for h in saved:
+            root.addHandler(h)
+
+
+def test_configure_logging_file_disabled_with_empty_env(monkeypatch):
+    """LINKSTART_LOG_FILE='' disables file logging (console only)."""
+    import logging
+    from logging.handlers import RotatingFileHandler
+    from linkstart.cli import configure_logging
+
+    monkeypatch.setenv("LINKSTART_LOG_FILE", "")
+    root = logging.getLogger()
+    saved = list(root.handlers)
+    for h in saved:
+        root.removeHandler(h)
+    try:
+        configure_logging()
+        assert not any(isinstance(h, RotatingFileHandler) for h in root.handlers)
+    finally:
+        for h in list(root.handlers):
+            root.removeHandler(h)
+            try:
+                h.close()
+            except Exception:
+                pass
+        for h in saved:
+            root.addHandler(h)
+
+
+def test_configure_diagnostics_enables_faulthandler():
+    """faulthandler must be enabled so a crash/stall dumps a traceback, and
+    SIGUSR1 registered so a wedged daemon can be inspected on demand
+    (`kill -USR1 <pid>`) without attaching a debugger."""
+    import faulthandler
+    import signal
+    from linkstart.observability import configure_diagnostics
+
+    configure_diagnostics()
+    assert faulthandler.is_enabled()
+    if hasattr(signal, "SIGUSR1"):
+        # register() installs a C-level handler (invisible to signal.getsignal);
+        # unregister() returns True only if one was registered. Re-register so
+        # diagnostics stay on for the rest of the process.
+        assert faulthandler.unregister(signal.SIGUSR1) is True
+        faulthandler.register(signal.SIGUSR1, all_threads=True)
 
 
 async def test_cmd_list_prints_channels(tmp_path, capsys):
@@ -321,7 +442,11 @@ summary:
                     "linkstart.notifier.discord.DiscordNotifier.close",
                     new=AsyncMock(),
                 ):
-                    rc = await cmd_run(Args())
+                    # capsys replaces sys.stderr with a fileno-less buffer, which
+                    # faulthandler.enable() in configure_diagnostics rejects; this
+                    # test isn't about diagnostics, so stub it out.
+                    with patch("linkstart.cli.configure_diagnostics"):
+                        rc = await cmd_run(Args())
 
     assert rc == 0
     # Both SIGINT and SIGTERM handlers registered (same callback).

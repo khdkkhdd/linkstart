@@ -9,6 +9,7 @@ from pathlib import Path
 from linkstart.config import load_config, merge_channel
 from linkstart.downloader import Downloader
 from linkstart.notifier.discord import DiscordNotifier
+from linkstart.observability import configure_diagnostics
 from linkstart.orchestrator import Orchestrator
 from linkstart.platforms.chzzk import ChzzkPlatform
 from linkstart.platforms.twitcasting import TwitcastingPlatform
@@ -45,13 +46,49 @@ def parse_args(argv=None):
     return args
 
 
-def configure_logging() -> None:
+def _resolve_log_file() -> Path | None:
+    """Return the log file path from ``LINKSTART_LOG_FILE``, or the default XDG state dir; empty env value disables file logging."""
     import os
+    env = os.environ.get("LINKSTART_LOG_FILE")
+    if env is not None:
+        return Path(env).expanduser() if env.strip() else None
+    return Path.home() / ".local" / "state" / "linkstart" / "linkstart.log"
+
+
+def configure_logging() -> None:
+    """Configure console + rotating-file logging."""
+    import os
+    from logging.handlers import RotatingFileHandler
     level = os.environ.get("LINKSTART_LOG_LEVEL", "INFO").upper()
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    root = logging.getLogger()
+    root.setLevel(level)
+    # Reset to a clean slate; close removed handlers to release file descriptors.
+    for h in list(root.handlers):
+        root.removeHandler(h)
+        try:
+            h.close()
+        except Exception:
+            pass
+
+    console = logging.StreamHandler()
+    console.setFormatter(fmt)
+    root.addHandler(console)
+
+    log_path = _resolve_log_file()
+    if log_path is not None:
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            file_handler = RotatingFileHandler(
+                log_path, maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8"
+            )
+            file_handler.setFormatter(fmt)
+            root.addHandler(file_handler)
+            logging.getLogger(__name__).info("logging to %s", log_path)
+        except OSError as e:
+            logging.getLogger(__name__).warning(
+                "could not open log file %s: %s (console logging only)", log_path, e
+            )
 
 
 def _build_platforms() -> dict:
@@ -63,6 +100,7 @@ def _build_platforms() -> dict:
 
 
 async def cmd_run(args) -> int:
+    configure_diagnostics()
     config = load_config(args.config)
     platforms = _build_platforms()
     notifiers = {

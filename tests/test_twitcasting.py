@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from aioresponses import aioresponses
 
-from linkstart.models import ChannelConfig
+from linkstart.models import ChannelConfig, LiveInfo
 from linkstart.platforms.twitcasting import TwitcastingPlatform
 
 
@@ -88,18 +88,36 @@ async def test_returns_none_on_network_error(channel):
 
 def test_build_url(channel):
     platform = TwitcastingPlatform()
-    url = platform.build_url(
-        channel,
-        live=None,  # type: ignore[arg-type]  # not used by impl
+    live = LiveInfo(
+        live_id="987654321",
+        title="t",
+        url="https://twitcasting.tv/abc",
     )
-    assert url == "https://twitcasting.tv/abc"
+    url = platform.build_url(channel, live)
+    # Pin to the specific movie so yt-dlp does not re-resolve the channel's
+    # "current movie" (which can be a stale id across broadcast transitions).
+    assert url == "https://twitcasting.tv/abc/movie/987654321"
 
 
-def test_yt_dlp_args(channel):
+def test_download_profile_is_mpegts(channel):
     platform = TwitcastingPlatform()
     # --live-from-start is controlled by the Downloader, not the platform.
-    # Platform contributes only the HLS format hint.
-    assert platform.yt_dlp_args(channel) == ["--hls-use-mpegts"]
+    # The platform declares an mpegts container (→ .ts parts + --hls-use-mpegts).
+    profile = platform.download_profile(channel)
+    assert profile.container == "mpegts"
+    assert profile.part_suffix == ".ts"
+    assert profile.to_yt_dlp_args() == ["--hls-use-mpegts"]
+
+
+def test_channel_downloader_override_applies():
+    # A per-channel `downloader: native` overrides the downloader engine while
+    # preserving the platform-intrinsic container — lets the operator switch to
+    # yt-dlp's native HLS downloader (for fMP4 streams) without a code change.
+    ch = ChannelConfig(platform="twitcasting", channel_id="abc", downloader="native")
+    profile = TwitcastingPlatform().download_profile(ch)
+    assert profile.downloader == "native"
+    assert profile.container == "mpegts"  # intrinsic, unchanged
+    assert "--hls-prefer-native" in profile.to_yt_dlp_args()
 
 
 def test_supports_live_from_start_false(channel):
