@@ -41,7 +41,26 @@ def test_download_profile_is_mpegts(channel):
     profile = p.download_profile(channel)
     assert profile.container == "mpegts"
     assert profile.part_suffix == ".ts"
-    assert profile.to_yt_dlp_args() == ["--hls-use-mpegts"]
+    assert profile.to_yt_dlp_args()[0] == "--hls-use-mpegts"
+
+
+def test_download_profile_relaxes_ffmpeg_extension_check(channel):
+    # Chzzk serves fMP4 segments named ".m4v"; ffmpeg's mov/mp4 demuxer does not
+    # claim that extension, so its default extension_picky=1 refuses the first
+    # segment ("mismatches allowed extensions") and the pull dies with exit 183.
+    p = ChzzkPlatform()
+    args = p.download_profile(channel).to_yt_dlp_args()
+    assert "--downloader-args" in args
+    assert args[args.index("--downloader-args") + 1] == "ffmpeg_i:-extension_picky 0"
+
+
+def test_download_profile_keeps_relaxation_under_downloader_override():
+    # A channel-level downloader override must not drop the extension-check flag.
+    p = ChzzkPlatform()
+    channel = ChannelConfig(platform="chzzk", channel_id=CHANNEL_ID, downloader="ffmpeg")
+    args = p.download_profile(channel).to_yt_dlp_args()
+    assert "--downloader-args" in args
+    assert args[args.index("--downloader") + 1] == "ffmpeg"
 
 
 async def test_returns_live_info_when_status_open(channel):

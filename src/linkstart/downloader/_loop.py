@@ -30,12 +30,25 @@ from linkstart.platforms.base import Platform
 log = logging.getLogger(__name__)
 
 
-def _stderr_excerpt(stderr: bytes, limit: int = 800) -> str:
-    """Return the tail of subprocess stderr (failures appear at the end, not the head)."""
+# Excerpts that ride along to notifications stay short; the log, which is where
+# failures actually get diagnosed, can afford the room.
+NOTIFY_STDERR_LIMIT = 800
+LOG_STDERR_LIMIT = 4000
+
+
+def _stderr_excerpt(stderr: bytes, limit: int = NOTIFY_STDERR_LIMIT) -> str:
+    """Return a bounded excerpt of subprocess stderr, keeping both ends.
+
+    The decisive line sits at either end: the "ERROR: …" summary at the tail, or
+    the first real complaint at the head — ffmpeg names the segment it refused
+    *before* the generic "Invalid data found" it ultimately exits on. What lies
+    between is repetitive per-fragment noise, so the middle is what gets dropped.
+    """
     text = stderr.decode(errors="replace").strip()
     if len(text) <= limit:
         return text
-    return "…" + text[-limit:]
+    head = limit // 3
+    return f"{text[:head]}…{text[-(limit - head):]}"
 
 
 InterruptCallback = Callable[[Event], Awaitable[None]]
@@ -133,7 +146,7 @@ class _DownloaderBase:
                 log.warning(
                     "yt-dlp %s exited with %s: %s",
                     loop_name, returncode,
-                    _stderr_excerpt(stderr),
+                    _stderr_excerpt(stderr, LOG_STDERR_LIMIT),
                 )
 
             # Stalled attempts count as no-output even if a stub was written.

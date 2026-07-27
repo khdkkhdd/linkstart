@@ -80,9 +80,23 @@ class ChzzkPlatform(Platform):
     def build_url(self, channel: ChannelConfig, live: LiveInfo) -> str:
         return f"https://chzzk.naver.com/live/{channel.channel_id}"
 
+    # Chzzk's live HLS is fMP4 (CMAF) whose media segments are named ".m4v", but
+    # ffmpeg probes them as mov/mp4 — a demuxer that does not list "m4v" among its
+    # extensions. With ffmpeg's default extension_picky=1 the hls demuxer rejects
+    # the first segment ("mismatches allowed extensions in url …") and exits 183,
+    # so every attempt produces zero bytes. Every chzzk format is protocol=m3u8
+    # (never m3u8_native), so yt-dlp must go through ffmpeg — relaxing the check
+    # on ffmpeg's input side is the only lever we have.
+    FFMPEG_EXTENSION_CHECK_ARGS: tuple[str, ...] = (
+        "--downloader-args", "ffmpeg_i:-extension_picky 0",
+    )
+
     def _base_download_profile(self, channel: ChannelConfig) -> DownloadProfile:
         # HLS-live → mpegts container (.ts parts + --hls-use-mpegts).
-        return DownloadProfile(container="mpegts")
+        return DownloadProfile(
+            container="mpegts",
+            extra_args=self.FFMPEG_EXTENSION_CHECK_ARGS,
+        )
 
     def get_auth_cookies(self, channel: ChannelConfig) -> dict[str, str] | None:
         if not channel.cookies_from_browser:

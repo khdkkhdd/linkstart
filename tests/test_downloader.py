@@ -13,7 +13,11 @@ from linkstart.downloader import (
     sanitize_title,
     unique_path,
 )
-from linkstart.downloader._loop import _stderr_excerpt
+from linkstart.downloader._loop import (
+    LOG_STDERR_LIMIT,
+    NOTIFY_STDERR_LIMIT,
+    _stderr_excerpt,
+)
 from linkstart.downloader._cleanup import (
     cleanup_dual,
     _recover_fragments as _cleanup_recover_fragments,
@@ -81,15 +85,22 @@ def test_stderr_excerpt_short_returned_whole():
     assert _stderr_excerpt(b"  boom happened  ") == "boom happened"
 
 
-def test_stderr_excerpt_keeps_tail_not_head():
-    # The real error lives at the END, after ffmpeg's "Opening ..." noise.
-    head = b"HEADMARKER" + b"x" * 1000
-    err = head + b"\nERROR: HTTP Error 404: Not Found"
-    out = _stderr_excerpt(err, limit=50)
-    assert out.startswith("…")
+def test_stderr_excerpt_keeps_both_ends_dropping_the_middle():
+    # The summary error lives at the END, but the line that explains *why* often
+    # comes first (ffmpeg names the rejected segment before the generic failure
+    # it exits on). Only the repetitive middle is expendable.
+    err = b"HEADMARKER" + b"x" * 1000 + b"\nERROR: HTTP Error 404: Not Found"
+    out = _stderr_excerpt(err, limit=90)
+    assert "HEADMARKER" in out
     assert "ERROR: HTTP Error 404: Not Found" in out
-    assert "HEADMARKER" not in out  # head was dropped
-    assert len(out) <= 51  # ellipsis + limit
+    assert "…" in out
+    assert len(out) <= 91  # ellipsis + limit
+
+
+def test_stderr_excerpt_log_limit_is_roomier_than_notify_limit():
+    # Notifications are size-constrained; the log is not, and it is where
+    # failures actually get diagnosed.
+    assert LOG_STDERR_LIMIT > NOTIFY_STDERR_LIMIT
 
 
 # --- Edge-only record tests ---
@@ -205,6 +216,49 @@ async def test_edge_only_logs_broadcast_ended(channel, live, caplog):
 
     msgs = [r.getMessage() for r in caplog.records]
     assert any("broadcast ended" in m and live.live_id in m for m in msgs), msgs
+
+
+async def test_failed_attempt_logs_the_cause_not_just_the_tail(channel, live, caplog):
+    """A failing yt-dlp attempt must log the line that explains the failure.
+
+    Regression: chzzk pulls died on ffmpeg's rejected-segment complaint, but the
+    excerpt kept only the last 800 chars, so the log showed nothing but the
+    generic "Invalid data found when processing input" — undiagnosable.
+    """
+    segment = "https://cdn.example/" + "s" * 300 + "/1080p_0_0_0.m4v"
+    stderr = (
+        f"[in#0] Opening '{segment}' for reading\n"
+        f"[in#0] Opening '{segment}' for reading\n"
+        "[in#0] detected format mov,mp4,m4a,3gp,3g2,mj2 extension "
+        f"mov,mp4,m4a,3gp mismatches allowed extensions in url {segment}\n"
+        f"[in#0] Error when loading first segment '{segment}'\n"
+        "[in#0] Error opening input: Invalid data found when processing input\n"
+        "Error opening input files: Invalid data found when processing input\n"
+        "ERROR: ffmpeg exited with code 183\n"
+    ).encode()
+    assert len(stderr) > NOTIFY_STDERR_LIMIT  # the cause is out of the tail's reach
+
+    plat = FakePlatform(check_results=[None])  # broadcast over after the attempt
+    dl = Downloader()
+
+    class FailingProc:
+        returncode = 1
+
+        async def communicate(self):
+            return b"", stderr
+
+    async def fake_exec(*args, **kwargs):
+        return FailingProc()  # exits nonzero, writes no output file
+
+    with caplog.at_level(logging.WARNING, logger="linkstart.downloader._loop"):
+        with patch(
+            "linkstart.downloader._process.asyncio.create_subprocess_exec",
+            new=AsyncMock(side_effect=fake_exec),
+        ):
+            await dl.record(channel, plat, live)
+
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("mismatches allowed extensions" in m for m in msgs), msgs
 
 
 async def test_edge_only_restarts_until_stream_ends(channel, live):
