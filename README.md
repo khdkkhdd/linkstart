@@ -4,7 +4,7 @@ Multi-platform live stream recorder. Detects when configured channels go live, r
 
 ## Features
 
-- Records **YouTube**, **TwitCasting**, **Chzzk** live streams
+- Records **YouTube**, **TwitCasting**, **Chzzk**, **CI.ME** live streams
 - **Smart restart**: yt-dlp dies → auto-relaunch as long as the broadcast is still live
 - **Dual-loop recording** for YouTube (`--live-from-start` + live-edge, deduped after broadcast ends)
 - **Visible interruption boundaries** in edge-only mode: each restart attempt is its own `.mp4`, no silent gap-hiding concat
@@ -75,6 +75,7 @@ summary:
 | TwitCasting | URL handle | `https://twitcasting.tv/<HERE>` |
 | YouTube | `@handle` or `UCxxxx` channel ID | `https://www.youtube.com/<HERE>` |
 | Chzzk | 32-char hex UUID | `https://chzzk.naver.com/<HERE>` — **not** the channel name |
+| CI.ME | channel slug (without `@`) | `https://ci.me/@<HERE>/live` |
 
 `alias` is optional but recommended for Chzzk (UUIDs are unreadable).
 
@@ -84,6 +85,7 @@ summary:
 |---|---|---|
 | TwitCasting | ✅ implemented | edge-only |
 | Chzzk | ✅ implemented | edge-only |
+| CI.ME | ✅ implemented | edge-only |
 | YouTube | ✅ implemented | dual-loop |
 
 Adding a new platform = a single class implementing `Platform` (see `src/linkstart/platforms/base.py`).
@@ -92,7 +94,7 @@ Adding a new platform = a single class implementing `Platform` (see `src/linksta
 
 Each platform records in one of two modes (chosen by `supports_live_from_start`):
 
-- **Edge-only** (TwitCasting, Chzzk): single yt-dlp loop from the moment the broadcast is detected. yt-dlp handles HLS fragment retries; the Downloader restarts immediately if yt-dlp exits while the broadcast is still live. **Each restart attempt becomes its own `.mp4`** so gaps between attempts are visible, not silently glued together.
+- **Edge-only** (TwitCasting, Chzzk, CI.ME): single yt-dlp loop from the moment the broadcast is detected. yt-dlp handles HLS fragment retries; the Downloader restarts immediately if yt-dlp exits while the broadcast is still live. **Each restart attempt becomes its own `.mp4`** so gaps between attempts are visible, not silently glued together.
 - **Dual-loop** (YouTube): two yt-dlp instances run concurrently — one with `--live-from-start` (5s between restarts) and one without (no sleep, follows the live edge). When the broadcast ends, ffprobe-based coverage dedup — anchored to the platform-reported broadcast start time — picks the longest from-start file as the base and keeps only edge fragments that add unique timeline coverage (≥ 5s). Output: one base `.mp4` plus zero or more `.edge_NNN.mp4` / `.recovered_NNN.mp4`.
 
 When yt-dlp itself crashes mid-recording, a `DOWNLOAD_INTERRUPTED` Discord embed fires (deduped within a 5-minute window so flaky uplinks don't spam) and the loop restarts automatically. If yt-dlp exits repeatedly without producing any data (unreadable cookies, disk full, ...), the recorder gives up after 3 consecutive attempts and surfaces the captured yt-dlp stderr as an `ERROR` notification instead of spinning silently — the next poll retries.

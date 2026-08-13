@@ -46,6 +46,11 @@ channels:
   #   # Optional: cookies for member-only / age-restricted streams.
   #   # cookies_from_browser: firefox
 
+  # - platform: cime
+  #   channel_id: "channel_slug"  # https://ci.me/@<HERE>/live (without @)
+  #   alias: "readable-name"
+  #   notifier: main
+
 summary:
   enabled: true
   cron: "0 9 * * *"   # daily 09:00 local

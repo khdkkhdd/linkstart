@@ -12,6 +12,7 @@ from linkstart.notifier.discord import DiscordNotifier
 from linkstart.observability import configure_diagnostics
 from linkstart.orchestrator import Orchestrator
 from linkstart.platforms.chzzk import ChzzkPlatform
+from linkstart.platforms.cime import CimePlatform
 from linkstart.platforms.twitcasting import TwitcastingPlatform
 from linkstart.platforms.youtube import YoutubePlatform
 from linkstart.state import StateStore
@@ -95,6 +96,7 @@ def _build_platforms() -> dict:
     return {
         "twitcasting": TwitcastingPlatform(),
         "chzzk": ChzzkPlatform(),
+        "cime": CimePlatform(),
         "youtube": YoutubePlatform(),
     }
 

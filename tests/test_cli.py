@@ -365,6 +365,9 @@ summary:
                     ), patch.object(
                         __import__("linkstart.platforms.youtube", fromlist=["YoutubePlatform"]).YoutubePlatform,
                         "close", new=mock_plat_close,
+                    ), patch.object(
+                        __import__("linkstart.platforms.cime", fromlist=["CimePlatform"]).CimePlatform,
+                        "close", new=mock_plat_close,
                     ):
                         rc = await cmd_run(Args())
 
@@ -374,7 +377,7 @@ summary:
     assert _signal.SIGINT in signal_handlers
     assert _signal.SIGTERM in signal_handlers
     # All registered platforms closed.
-    assert len(closed_platforms) == 3
+    assert len(closed_platforms) == 4
     # The single Discord notifier closed.
     assert len(closed_notifiers) == 1
 
