@@ -66,7 +66,12 @@ class EdgeRecordingStrategy(RecordingStrategy):
             no_output_fail_limit=self.NO_OUTPUT_FAIL_LIMIT,
         )
 
-        part_files = sorted(parts_dir.glob(f"part*{suffix}"))
+        # A watchdog-killed yt-dlp never renames its `.part` temp file, so the
+        # capture survives only as `partNN{suffix}.part` — collect both forms.
+        part_files = sorted(
+            set(parts_dir.glob(f"part*{suffix}"))
+            | set(parts_dir.glob(f"part*{suffix}.part"))
+        )
         if not part_files:
             ctx.paths.discard_parts_dir(parts_dir)
             return DownloadResult(
@@ -75,22 +80,46 @@ class EdgeRecordingStrategy(RecordingStrategy):
                 retry_count=retries,
             )
 
+        # First part that remuxes becomes the final file, later ones extras.
+        # A part ffmpeg cannot convert is kept as a raw salvage file — captured
+        # bytes are never deleted unconverted.
         final_path = unique_path(ctx.paths.final_path(channel, live))
-        if not await ctx.media.remux(part_files[0], final_path):
-            ctx.paths.discard_parts_dir(parts_dir)
-            return DownloadResult(
-                success=False, error="ffmpeg remux failed", retry_count=retries
-            )
-
         extras: list[Path] = []
-        for i, part in enumerate(part_files[1:], start=1):
-            extra_path = final_path.with_name(
-                f"{final_path.stem}.part_{i:03d}.mp4"
-            )
-            if await ctx.media.remux(part, extra_path):
-                extras.append(extra_path)
+        main_ok = False
+        raw_index = 0
+        for part in part_files:
+            if main_ok:
+                target = final_path.with_name(
+                    f"{final_path.stem}.part_{len(extras) + 1:03d}.mp4"
+                )
+            else:
+                target = final_path
+            if await ctx.media.remux(part, target):
+                if main_ok:
+                    extras.append(target)
+                main_ok = True
+            else:
+                raw_path = unique_path(final_path.with_name(
+                    f"{final_path.stem}.raw_{raw_index:03d}{suffix}"
+                ))
+                part.rename(raw_path)
+                raw_index += 1
+                log.warning(
+                    "remux failed for %s — raw capture preserved as %s",
+                    part.name, raw_path.name,
+                )
 
         shutil.rmtree(parts_dir, ignore_errors=True)
+
+        if not main_ok:
+            # When the attempt loop already gave up, that is the root cause;
+            # unconvertible stubs are just its debris.
+            return DownloadResult(
+                success=False,
+                error=fail_error or "ffmpeg remux failed",
+                retry_count=retries,
+            )
+
         duration = int(event_loop.time() - start_time)
         size = final_path.stat().st_size if final_path.exists() else 0
         size += sum(p.stat().st_size for p in extras if p.exists())

@@ -244,3 +244,18 @@ async def test_check_live_attaches_auth_cookies(monkeypatch):
     # doesn't gate on cookies). This test mainly verifies the cookie path
     # doesn't crash and the request is made successfully.
     assert info is not None
+
+
+async def test_owned_session_is_tuned_and_reused():
+    from linkstart.platforms._http import DNS_CACHE_TTL_S, KEEPALIVE_TIMEOUT_S
+
+    platform = ChzzkPlatform()
+    try:
+        first = await platform._get_session()
+        second = await platform._get_session()
+        assert first is second
+        assert first.connector._keepalive_timeout == KEEPALIVE_TIMEOUT_S
+        assert first.connector._cached_hosts._ttl == DNS_CACHE_TTL_S
+        assert "Mozilla/5.0" in first.headers["User-Agent"]
+    finally:
+        await platform.close()

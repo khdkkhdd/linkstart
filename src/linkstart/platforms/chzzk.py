@@ -6,6 +6,7 @@ import aiohttp
 
 from linkstart.auth import get_browser_cookies
 from linkstart.models import ChannelConfig, DownloadProfile, LiveInfo
+from linkstart.platforms._http import create_polling_session, polling_get
 from linkstart.platforms.base import Platform
 
 log = logging.getLogger(__name__)
@@ -25,7 +26,7 @@ class ChzzkPlatform(Platform):
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None:
             # Chzzk's API rejects requests without a browser-like User-Agent.
-            self._session = aiohttp.ClientSession(
+            self._session = create_polling_session(
                 headers={
                     "User-Agent": (
                         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -46,7 +47,8 @@ class ChzzkPlatform(Platform):
         cookies = self.get_auth_cookies(channel)
         try:
             session = await self._get_session()
-            async with session.get(
+            async with polling_get(
+                session,
                 url,
                 cookies=cookies or {},
                 timeout=aiohttp.ClientTimeout(total=10),

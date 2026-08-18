@@ -157,3 +157,19 @@ def test_get_auth_cookies_with_browser(monkeypatch):
     monkeypatch.setattr("linkstart.platforms.cime.get_browser_cookies", fake_get)
     assert CimePlatform().get_auth_cookies(channel) == {"session-id": "token"}
     assert captured == {"domain": ".ci.me", "browser": "firefox"}
+
+
+async def test_owned_session_is_tuned_and_reused():
+    from linkstart.platforms._http import DNS_CACHE_TTL_S, KEEPALIVE_TIMEOUT_S
+
+    platform = CimePlatform()
+    try:
+        first = await platform._get_session()
+        second = await platform._get_session()
+        assert first is second
+        assert first.connector._keepalive_timeout == KEEPALIVE_TIMEOUT_S
+        assert first.connector._cached_hosts._ttl == DNS_CACHE_TTL_S
+        assert "Mozilla/5.0" in first.headers["User-Agent"]
+        assert first.headers["Accept-Language"].startswith("ko-KR")
+    finally:
+        await platform.close()

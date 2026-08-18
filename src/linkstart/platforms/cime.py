@@ -17,6 +17,7 @@ import aiohttp
 
 from linkstart.auth import get_browser_cookies
 from linkstart.models import ChannelConfig, DownloadProfile, LiveInfo
+from linkstart.platforms._http import create_polling_session, polling_get
 from linkstart.platforms.base import Platform
 
 log = logging.getLogger(__name__)
@@ -109,7 +110,7 @@ class CimePlatform(Platform):
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None:
-            self._session = aiohttp.ClientSession(
+            self._session = create_polling_session(
                 headers={
                     "User-Agent": (
                         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -131,7 +132,8 @@ class CimePlatform(Platform):
         cookies = self.get_auth_cookies(channel)
         try:
             session = await self._get_session()
-            async with session.get(
+            async with polling_get(
+                session,
                 page_url,
                 cookies=cookies or {},
                 timeout=aiohttp.ClientTimeout(total=15),

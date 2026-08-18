@@ -311,3 +311,17 @@ async def test_ffprobe_metrics_returns_none_on_malformed_output(tmp_path):
         metrics = await platform._ffprobe_metrics(f)
 
     assert metrics is None
+
+
+async def test_owned_session_is_tuned_and_reused():
+    from linkstart.platforms._http import DNS_CACHE_TTL_S, KEEPALIVE_TIMEOUT_S
+
+    platform = TwitcastingPlatform()
+    try:
+        first = await platform._get_session()
+        second = await platform._get_session()
+        assert first is second
+        assert first.connector._keepalive_timeout == KEEPALIVE_TIMEOUT_S
+        assert first.connector._cached_hosts._ttl == DNS_CACHE_TTL_S
+    finally:
+        await platform.close()

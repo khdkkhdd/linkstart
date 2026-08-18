@@ -542,6 +542,114 @@ async def test_edge_only_returns_failure_when_remux_fails(channel, live):
     assert result.error == "ffmpeg remux failed"
 
 
+async def test_edge_only_salvages_killed_attempt_part_file(channel, live):
+    """A stall-killed yt-dlp never renames `partNN.ts.part` → `partNN.ts`, so
+    finalize must pick up `.part` temp files too — in chronological order.
+
+    Regression: 2026-08-16 cime recording — a 3.5GB `part00.ts.part` from a
+    watchdog-killed attempt was invisible to the `part*.ts` glob and deleted
+    by the parts-dir cleanup; only the 10MB post-restart part survived."""
+    plat = FakePlatform(check_results=[live, None])
+    dl = Downloader()
+    call_index = {"n": 0}
+
+    async def fake_exec(*args, **kwargs):
+        call_index["n"] += 1
+        out_idx = args.index("-o")
+        out = Path(args[out_idx + 1])
+        if call_index["n"] == 1:
+            # Killed mid-download: only yt-dlp's .part temp file remains.
+            out.with_name(out.name + ".part").write_bytes(b"captured-before-kill")
+        else:
+            out.write_bytes(b"tail-after-restart")
+        return FakeProc(returncode=0)
+
+    remuxed_sources = []
+
+    async def fake_remux(part, target):
+        remuxed_sources.append(part.name)
+        target.write_bytes(b"remuxed_" + part.name.encode())
+        return True
+
+    with patch.object(dl.media, "remux", new=AsyncMock(side_effect=fake_remux)):
+        with patch(
+            "linkstart.downloader._process.asyncio.create_subprocess_exec",
+            new=AsyncMock(side_effect=fake_exec),
+        ):
+            result = await dl.record(channel, plat, live)
+
+    assert result.success is True
+    # The killed attempt's data comes first and becomes the main file.
+    assert remuxed_sources == ["part00.ts.part", "part01.ts"]
+    assert result.file_path.read_bytes() == b"remuxed_part00.ts.part"
+    assert len(result.extra_files) == 1
+    assert result.extra_files[0].read_bytes() == b"remuxed_part01.ts"
+
+
+async def test_edge_only_preserves_raw_part_when_remux_fails(channel, live):
+    """Captured bytes that ffmpeg cannot remux must survive on disk as a raw
+    salvage file — finalize must never delete data it failed to convert."""
+    plat = FakePlatform(check_results=[None])
+    dl = Downloader()
+
+    async def fake_exec(*args, **kwargs):
+        out_idx = args.index("-o")
+        Path(args[out_idx + 1]).write_bytes(b"unconvertible-data")
+        return FakeProc(returncode=0)
+
+    async def fake_remux(part, target):
+        return False
+
+    with patch.object(dl.media, "remux", new=AsyncMock(side_effect=fake_remux)):
+        with patch(
+            "linkstart.downloader._process.asyncio.create_subprocess_exec",
+            new=AsyncMock(side_effect=fake_exec),
+        ):
+            result = await dl.record(channel, plat, live)
+
+    assert result.success is False
+    assert result.error == "ffmpeg remux failed"
+    raws = list(channel.save_dir.rglob("*.raw_*"))
+    assert len(raws) == 1
+    assert raws[0].read_bytes() == b"unconvertible-data"
+    # The parts dir itself is still cleaned up.
+    assert list(channel.save_dir.rglob("*.parts")) == []
+
+
+async def test_edge_only_preserves_raw_extra_when_its_remux_fails(channel, live):
+    """When an extra part fails to remux, the main file still wins but the
+    failing part's raw bytes are kept instead of deleted."""
+    plat = FakePlatform(check_results=[live, None])
+    dl = Downloader()
+
+    async def fake_exec(*args, **kwargs):
+        out_idx = args.index("-o")
+        Path(args[out_idx + 1]).write_bytes(b"part-bytes")
+        return FakeProc(returncode=0)
+
+    call_count = {"n": 0}
+
+    async def fake_remux(part, target):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            target.write_bytes(b"main")
+            return True
+        return False   # second remux (the extra) fails
+
+    with patch.object(dl.media, "remux", new=AsyncMock(side_effect=fake_remux)):
+        with patch(
+            "linkstart.downloader._process.asyncio.create_subprocess_exec",
+            new=AsyncMock(side_effect=fake_exec),
+        ):
+            result = await dl.record(channel, plat, live)
+
+    assert result.success is True
+    assert result.extra_files == []
+    raws = list(channel.save_dir.rglob("*.raw_*"))
+    assert len(raws) == 1
+    assert raws[0].read_bytes() == b"part-bytes"
+
+
 async def test_edge_only_sleeps_between_attempts_when_configured(channel, live, monkeypatch):
     """EDGE_LOOP_SLEEP > 0 → asyncio.sleep is awaited between yt-dlp restarts."""
     plat = FakePlatform(check_results=[live, None])
@@ -1414,11 +1522,14 @@ async def test_edge_only_aborts_slow_trickle_via_throughput_floor(channel, live,
         Path(args[out_idx + 1] + ".part").write_bytes(b"x" * 100)
         return proc
 
-    with patch(
-        "linkstart.downloader._process.asyncio.create_subprocess_exec",
-        new=AsyncMock(side_effect=fake_exec),
-    ):
-        result = await asyncio.wait_for(dl.record(channel, plat, live), timeout=2.0)
+    # The stalled attempt's .part stub now reaches finalize; ffmpeg can't
+    # convert the garbage stub, so remux reports failure.
+    with patch.object(dl.media, "remux", new=AsyncMock(return_value=False)):
+        with patch(
+            "linkstart.downloader._process.asyncio.create_subprocess_exec",
+            new=AsyncMock(side_effect=fake_exec),
+        ):
+            result = await asyncio.wait_for(dl.record(channel, plat, live), timeout=2.0)
 
     assert procs[0].terminate_called is True
     assert result.success is False
@@ -1443,13 +1554,15 @@ async def test_edge_only_gives_up_after_repeated_stalls(channel, live, monkeypat
         Path(args[out_idx + 1] + ".part").write_bytes(b"x" * 100)
         return proc
 
-    with patch(
-        "linkstart.downloader._process.asyncio.create_subprocess_exec",
-        new=AsyncMock(side_effect=fake_exec),
-    ):
-        result = await asyncio.wait_for(dl.record(channel, plat, live), timeout=3.0)
+    with patch.object(dl.media, "remux", new=AsyncMock(return_value=False)):
+        with patch(
+            "linkstart.downloader._process.asyncio.create_subprocess_exec",
+            new=AsyncMock(side_effect=fake_exec),
+        ):
+            result = await asyncio.wait_for(dl.record(channel, plat, live), timeout=3.0)
 
     assert result.success is False
+    # The loop's give-up reason survives even though the stubs couldn't remux.
     assert "stall" in (result.error or "").lower()
     # Gave up at the limit — did NOT loop through all 50 still-live checks.
     assert len(procs) == EdgeRecordingStrategy.NO_OUTPUT_FAIL_LIMIT
@@ -1474,11 +1587,12 @@ async def test_heartbeat_label_includes_loop_name(channel, live, caplog, monkeyp
         return proc
 
     with caplog.at_level(logging.INFO, logger="linkstart.downloader._watchdog"):
-        with patch(
-            "linkstart.downloader._process.asyncio.create_subprocess_exec",
-            new=AsyncMock(side_effect=fake_exec),
-        ):
-            await asyncio.wait_for(dl.record(channel, plat, live), timeout=2.0)
+        with patch.object(dl.media, "remux", new=AsyncMock(return_value=False)):
+            with patch(
+                "linkstart.downloader._process.asyncio.create_subprocess_exec",
+                new=AsyncMock(side_effect=fake_exec),
+            ):
+                await asyncio.wait_for(dl.record(channel, plat, live), timeout=2.0)
 
     msgs = [r.getMessage() for r in caplog.records]
     assert any("recording" in m and "[edge]" in m for m in msgs), msgs

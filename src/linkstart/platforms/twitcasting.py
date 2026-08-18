@@ -12,6 +12,7 @@ from linkstart.models import (
     LiveInfo,
     ValidationResult,
 )
+from linkstart.platforms._http import create_polling_session, polling_get
 from linkstart.platforms.base import Platform
 
 log = logging.getLogger(__name__)
@@ -40,7 +41,7 @@ class TwitcastingPlatform(Platform):
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None:
-            self._session = aiohttp.ClientSession()
+            self._session = create_polling_session()
         return self._session
 
     async def close(self) -> None:
@@ -52,7 +53,8 @@ class TwitcastingPlatform(Platform):
         params = {"target": channel.channel_id, "mode": "client"}
         try:
             session = await self._get_session()
-            async with session.get(
+            async with polling_get(
+                session,
                 self.STREAMSERVER_URL,
                 params=params,
                 timeout=aiohttp.ClientTimeout(total=10),
