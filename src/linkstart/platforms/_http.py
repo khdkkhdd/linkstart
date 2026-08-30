@@ -1,11 +1,5 @@
-"""Shared HTTP helpers for platform polling.
-
-Polling hits the same few hosts every 20-30 s, 24/7.  aiohttp's defaults
-(keep-alive 15 s, DNS cache 10 s) both expire between polls, so every poll
-used to open a fresh TCP+TLS connection and DNS lookup — a constant stream
-of new NAT sessions through the home router (see the 2026-08-18 outage
-post-mortem in docs/superpowers/specs/2026-08-18-polling-keepalive-design.md).
-"""
+"""Shared HTTP helpers for platform polling — aiohttp defaults expire between
+20-30 s polls, so every poll opened a fresh TCP+TLS+DNS round (2026-08-18 outage)."""
 import logging
 from contextlib import asynccontextmanager
 
@@ -13,12 +7,8 @@ import aiohttp
 
 log = logging.getLogger(__name__)
 
-# Longer than every poll gap (20-30 s) so idle connections survive until the
-# next poll; shorter than common server idle timeouts (75 s+) so we rarely
-# reuse a connection the server has already abandoned.
+# Longer than the poll gap (20-30 s), shorter than server idle timeouts (75 s+).
 KEEPALIVE_TIMEOUT_S: float = 60.0
-
-# One DNS lookup per host per 5 minutes instead of per poll.
 DNS_CACHE_TTL_S: int = 300
 
 
@@ -35,14 +25,9 @@ def create_polling_session(
 
 @asynccontextmanager
 async def polling_get(session: aiohttp.ClientSession, url: str, **kwargs):
-    """``session.get`` wrapper that retries ONCE on ServerDisconnectedError.
-
-    With keep-alive enabled, a poll can race the server closing the idle
-    connection; the request then fails with ServerDisconnectedError before
-    anything was received.  GET is idempotent, so one immediate retry on a
-    fresh connection is safe.  Only the request phase is retried — errors
-    raised while the caller reads the body propagate unchanged.
-    """
+    """``session.get`` retrying ONCE on ServerDisconnectedError — a keep-alive
+    poll can race the server closing the idle connection, and GET is idempotent.
+    Only the request phase retries; body-read errors propagate unchanged."""
     try:
         resp = await session.get(url, **kwargs)
     except aiohttp.ServerDisconnectedError:

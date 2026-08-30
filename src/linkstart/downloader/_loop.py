@@ -8,7 +8,12 @@ from typing import Awaitable, Callable
 from linkstart.cooldown import Cooldown
 from linkstart.downloader._media import MediaTools
 from linkstart.downloader._paths import RecordingPaths
-from linkstart.downloader._process import ProcessRunner
+from linkstart.downloader._process import (
+    LOG_STDERR_LIMIT,
+    NOTIFY_STDERR_LIMIT,
+    ProcessRunner,
+    _stderr_excerpt,
+)
 from linkstart.downloader._stall import NeverAbortStallPolicy, StallPolicy
 from linkstart.downloader._watchdog import (
     HEARTBEAT_INTERVAL_SEC as _HB_INTERVAL_SEC,
@@ -28,27 +33,6 @@ from linkstart.models import (
 from linkstart.platforms.base import Platform
 
 log = logging.getLogger(__name__)
-
-
-# Excerpts that ride along to notifications stay short; the log, which is where
-# failures actually get diagnosed, can afford the room.
-NOTIFY_STDERR_LIMIT = 800
-LOG_STDERR_LIMIT = 4000
-
-
-def _stderr_excerpt(stderr: bytes, limit: int = NOTIFY_STDERR_LIMIT) -> str:
-    """Return a bounded excerpt of subprocess stderr, keeping both ends.
-
-    The decisive line sits at either end: the "ERROR: …" summary at the tail, or
-    the first real complaint at the head — ffmpeg names the segment it refused
-    *before* the generic "Invalid data found" it ultimately exits on. What lies
-    between is repetitive per-fragment noise, so the middle is what gets dropped.
-    """
-    text = stderr.decode(errors="replace").strip()
-    if len(text) <= limit:
-        return text
-    head = limit // 3
-    return f"{text[:head]}…{text[-(limit - head):]}"
 
 
 InterruptCallback = Callable[[Event], Awaitable[None]]

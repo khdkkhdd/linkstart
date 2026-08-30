@@ -5,6 +5,20 @@ import contextlib
 import os
 import signal
 
+# Notification excerpts stay short; the log can afford the room.
+NOTIFY_STDERR_LIMIT = 800
+LOG_STDERR_LIMIT = 4000
+
+
+def _stderr_excerpt(stderr: bytes, limit: int = NOTIFY_STDERR_LIMIT) -> str:
+    """Bounded stderr excerpt keeping head and tail — the decisive line sits
+    at either end; the middle is repetitive per-fragment noise."""
+    text = stderr.decode(errors="replace").strip()
+    if len(text) <= limit:
+        return text
+    head = limit // 3
+    return f"{text[:head]}…{text[-(limit - head):]}"
+
 
 class ProcessRunner:
     # Max wait after each teardown signal (SIGTERM, then SIGKILL).

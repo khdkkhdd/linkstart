@@ -543,12 +543,8 @@ async def test_edge_only_returns_failure_when_remux_fails(channel, live):
 
 
 async def test_edge_only_salvages_killed_attempt_part_file(channel, live):
-    """A stall-killed yt-dlp never renames `partNN.ts.part` → `partNN.ts`, so
-    finalize must pick up `.part` temp files too — in chronological order.
-
-    Regression: 2026-08-16 cime recording — a 3.5GB `part00.ts.part` from a
-    watchdog-killed attempt was invisible to the `part*.ts` glob and deleted
-    by the parts-dir cleanup; only the 10MB post-restart part survived."""
+    """Finalize must pick up a stall-killed attempt's unrenamed `.part` temp
+    file, in chronological order (2026-08-16: a 3.5GB one was rmtree'd)."""
     plat = FakePlatform(check_results=[live, None])
     dl = Downloader()
     call_index = {"n": 0}
@@ -587,8 +583,7 @@ async def test_edge_only_salvages_killed_attempt_part_file(channel, live):
 
 
 async def test_edge_only_preserves_raw_part_when_remux_fails(channel, live):
-    """Captured bytes that ffmpeg cannot remux must survive on disk as a raw
-    salvage file — finalize must never delete data it failed to convert."""
+    """Bytes ffmpeg cannot remux survive as a raw salvage file, never deleted."""
     plat = FakePlatform(check_results=[None])
     dl = Downloader()
 
@@ -617,8 +612,7 @@ async def test_edge_only_preserves_raw_part_when_remux_fails(channel, live):
 
 
 async def test_edge_only_preserves_raw_extra_when_its_remux_fails(channel, live):
-    """When an extra part fails to remux, the main file still wins but the
-    failing part's raw bytes are kept instead of deleted."""
+    """An extra part failing remux keeps its raw bytes; the main file still wins."""
     plat = FakePlatform(check_results=[live, None])
     dl = Downloader()
 
@@ -1522,8 +1516,7 @@ async def test_edge_only_aborts_slow_trickle_via_throughput_floor(channel, live,
         Path(args[out_idx + 1] + ".part").write_bytes(b"x" * 100)
         return proc
 
-    # The stalled attempt's .part stub now reaches finalize; ffmpeg can't
-    # convert the garbage stub, so remux reports failure.
+    # Stalled .part stubs now reach finalize; the garbage stub fails remux.
     with patch.object(dl.media, "remux", new=AsyncMock(return_value=False)):
         with patch(
             "linkstart.downloader._process.asyncio.create_subprocess_exec",

@@ -1,16 +1,10 @@
-"""CI.ME platform — detects live broadcasts from the public live page.
-
-CI.ME publishes a schema.org ``VideoObject`` for active broadcasts.  Using
-that server-rendered JSON-LD keeps polling unauthenticated and avoids spawning
-yt-dlp merely to determine whether a channel is live.  The same object exposes
-the IVS HLS master URL, which is cached for the recorder.
-"""
+"""CI.ME platform — live detection via the live-page API
+(``/api/app/page/live/{slug}``, unauthenticated); the same response carries
+the IVS HLS playback URL."""
 import asyncio
-import hashlib
 import json
 import logging
 from datetime import datetime
-from html.parser import HTMLParser
 from typing import Any
 
 import aiohttp
@@ -21,63 +15,6 @@ from linkstart.platforms._http import create_polling_session, polling_get
 from linkstart.platforms.base import Platform
 
 log = logging.getLogger(__name__)
-
-
-class _JsonLdParser(HTMLParser):
-    """Collect application/ld+json script bodies without extra dependencies."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.documents: list[str] = []
-        self._current: list[str] | None = None
-
-    def handle_starttag(
-        self, tag: str, attrs: list[tuple[str, str | None]]
-    ) -> None:
-        if tag.lower() != "script":
-            return
-        attr_map = {key.lower(): value for key, value in attrs}
-        script_type = (attr_map.get("type") or "").lower()
-        if script_type == "application/ld+json":
-            self._current = []
-
-    def handle_data(self, data: str) -> None:
-        if self._current is not None:
-            self._current.append(data)
-
-    def handle_endtag(self, tag: str) -> None:
-        if tag.lower() == "script" and self._current is not None:
-            self.documents.append("".join(self._current))
-            self._current = None
-
-
-def _has_type(value: object, expected: str) -> bool:
-    if isinstance(value, str):
-        return value == expected
-    return isinstance(value, list) and expected in value
-
-
-def _find_live_video(document: Any) -> dict[str, Any] | None:
-    """Return the live VideoObject from one decoded JSON-LD document."""
-    if isinstance(document, list):
-        candidates = document
-    elif isinstance(document, dict):
-        graph = document.get("@graph")
-        candidates = graph if isinstance(graph, list) else [document]
-    else:
-        return None
-
-    for item in candidates:
-        if not isinstance(item, dict) or not _has_type(item.get("@type"), "VideoObject"):
-            continue
-        publication = item.get("publication")
-        if not isinstance(publication, dict):
-            continue
-        if not _has_type(publication.get("@type"), "BroadcastEvent"):
-            continue
-        if publication.get("isLiveBroadcast") is True:
-            return item
-    return None
 
 
 def _parse_datetime(value: object) -> datetime | None:
@@ -93,12 +30,15 @@ class CimePlatform(Platform):
     name = "cime"
 
     PAGE_URL_TEMPLATE = "https://ci.me/@{channel_id}/live"
+    API_URL_TEMPLATE = "https://ci.me/api/app/page/live/{channel_id}"
 
     def __init__(self, session: aiohttp.ClientSession | None = None) -> None:
         self._session = session
         self._owns_session = session is None
         # channel slug -> (live id, HLS master URL)
         self._playback_by_channel: dict[str, tuple[str, str]] = {}
+        # channel slug -> (live id, from-start VOD master URL)
+        self._full_by_channel: dict[str, tuple[str, str]] = {}
 
     @staticmethod
     def _slug(channel: ChannelConfig) -> str:
@@ -107,6 +47,9 @@ class CimePlatform(Platform):
 
     def _page_url(self, channel: ChannelConfig) -> str:
         return self.PAGE_URL_TEMPLATE.format(channel_id=self._slug(channel))
+
+    def _api_url(self, channel: ChannelConfig) -> str:
+        return self.API_URL_TEMPLATE.format(channel_id=self._slug(channel))
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None:
@@ -128,13 +71,12 @@ class CimePlatform(Platform):
             self._session = None
 
     async def check_live(self, channel: ChannelConfig) -> LiveInfo | None:
-        page_url = self._page_url(channel)
         cookies = self.get_auth_cookies(channel)
         try:
             session = await self._get_session()
             async with polling_get(
                 session,
-                page_url,
+                self._api_url(channel),
                 cookies=cookies or {},
                 timeout=aiohttp.ClientTimeout(total=15),
             ) as resp:
@@ -145,79 +87,78 @@ class CimePlatform(Platform):
                         "cime: HTTP %s for %s", resp.status, channel.channel_id
                     )
                     return None
-                html = await resp.text()
+                body = await resp.text()
         except (aiohttp.ClientError, asyncio.TimeoutError, ConnectionError) as e:
             log.warning("cime: request failed for %s: %s", channel.channel_id, e)
             return None
 
-        parser = _JsonLdParser()
         try:
-            parser.feed(html)
-        except Exception as e:
-            log.warning("cime: invalid HTML for %s: %s", channel.channel_id, e)
+            payload = json.loads(body)
+        except (json.JSONDecodeError, TypeError) as e:
+            log.warning("cime: invalid JSON for %s: %s", channel.channel_id, e)
             return None
 
-        video: dict[str, Any] | None = None
-        for raw_document in parser.documents:
-            try:
-                document = json.loads(raw_document)
-            except (json.JSONDecodeError, TypeError):
-                continue
-            video = _find_live_video(document)
-            if video is not None:
-                break
-
-        playback_url = video.get("contentUrl") if video is not None else None
-        if video is None or not isinstance(playback_url, str) or not playback_url:
-            self._playback_by_channel.pop(self._slug(channel), None)
+        data = payload.get("data") if isinstance(payload, dict) else None
+        live = data.get("live") if isinstance(data, dict) else None
+        if not isinstance(live, dict):
+            return None
+        if live.get("state") != "ACTIVE":
             return None
 
-        publication = video.get("publication")
-        assert isinstance(publication, dict)  # guaranteed by _find_live_video
-        start_raw = publication.get("startDate") or video.get("uploadDate")
-        started_at = _parse_datetime(start_raw)
-        if isinstance(start_raw, str) and start_raw:
-            live_id = start_raw
+        opened_raw = live.get("openedAt")
+        if isinstance(opened_raw, str) and opened_raw:
+            live_id = opened_raw
         else:
-            # Defensive fallback for an incomplete JSON-LD document. The
-            # playback URL is stable for the lifetime of the active broadcast.
-            live_id = hashlib.sha256(playback_url.encode()).hexdigest()[:20]
-
-        thumbnail_raw = video.get("thumbnailUrl")
-        if isinstance(thumbnail_raw, list):
-            thumbnail = next(
-                (value for value in thumbnail_raw if isinstance(value, str) and value),
-                None,
-            )
-        elif isinstance(thumbnail_raw, str) and thumbnail_raw:
-            thumbnail = thumbnail_raw
-        else:
-            thumbnail = None
+            live_id = str(live.get("id"))
 
         slug = self._slug(channel)
-        self._playback_by_channel[slug] = (live_id, playback_url)
-        public_url = video.get("url")
-        if not isinstance(public_url, str) or not public_url:
-            public_url = page_url
+        playback = live.get("playback")
+        playback_url = playback.get("url") if isinstance(playback, dict) else None
+        if isinstance(playback_url, str) and playback_url:
+            self._playback_by_channel[slug] = (live_id, playback_url)
+        else:
+            self._playback_by_channel.pop(slug, None)
+            log.warning(
+                "cime: live detected for %s but no playback URL in API response",
+                channel.channel_id,
+            )
+
+        thumbnail = live.get("imageUrl")
+        if isinstance(thumbnail, str) and "/media/" in thumbnail:
+            session_prefix = thumbnail.split("/media/", 1)[0]
+            self._full_by_channel[slug] = (
+                live_id, f"{session_prefix}/media/hls/master.m3u8"
+            )
+        else:
+            self._full_by_channel.pop(slug, None)
+
         return LiveInfo(
             live_id=live_id,
-            title=video.get("name") if isinstance(video.get("name"), str) else "",
-            url=public_url,
-            started_at=started_at,
-            thumbnail_url=thumbnail,
+            title=live.get("title") if isinstance(live.get("title"), str) else "",
+            url=self._page_url(channel),
+            started_at=_parse_datetime(opened_raw),
+            thumbnail_url=thumbnail if isinstance(thumbnail, str) and thumbnail else None,
         )
 
     def build_url(self, channel: ChannelConfig, live: LiveInfo) -> str:
         cached = self._playback_by_channel.get(self._slug(channel))
         if cached is not None and cached[0] == live.live_id:
             return cached[1]
-        # The generic yt-dlp extractor understands CI.ME's JSON-LD, so the
-        # public page remains a safe fallback if the in-memory cache is absent.
+        # yt-dlp's generic extractor reads the page's JSON-LD — safe fallback.
         return self._page_url(channel)
 
+    def build_full_url(self, channel: ChannelConfig, live: LiveInfo) -> str | None:
+        cached = self._full_by_channel.get(self._slug(channel))
+        if cached is not None and cached[0] == live.live_id:
+            return cached[1]
+        return None
+
+    def recording_strategy(self, ctx):
+        from linkstart.downloader._snapshot_dual import SnapshotDualRecordingStrategy
+        return SnapshotDualRecordingStrategy(ctx)
+
     def _base_download_profile(self, channel: ChannelConfig) -> DownloadProfile:
-        # CI.ME uses Amazon IVS HLS. Native fragment downloading plus mpegts
-        # part files keeps an interrupted capture playable and restartable.
+        # IVS HLS: native downloader + mpegts keeps interrupted captures playable.
         return DownloadProfile(
             container="mpegts",
             downloader="native",

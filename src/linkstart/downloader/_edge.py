@@ -66,8 +66,7 @@ class EdgeRecordingStrategy(RecordingStrategy):
             no_output_fail_limit=self.NO_OUTPUT_FAIL_LIMIT,
         )
 
-        # A watchdog-killed yt-dlp never renames its `.part` temp file, so the
-        # capture survives only as `partNN{suffix}.part` — collect both forms.
+        # A watchdog-killed yt-dlp leaves its capture as an unrenamed `.part` temp file.
         part_files = sorted(
             set(parts_dir.glob(f"part*{suffix}"))
             | set(parts_dir.glob(f"part*{suffix}.part"))
@@ -80,9 +79,8 @@ class EdgeRecordingStrategy(RecordingStrategy):
                 retry_count=retries,
             )
 
-        # First part that remuxes becomes the final file, later ones extras.
-        # A part ffmpeg cannot convert is kept as a raw salvage file — captured
-        # bytes are never deleted unconverted.
+        # First part that remuxes → final file, later ones → extras; a part
+        # ffmpeg cannot convert is preserved raw, never deleted unconverted.
         final_path = unique_path(ctx.paths.final_path(channel, live))
         extras: list[Path] = []
         main_ok = False
@@ -112,8 +110,7 @@ class EdgeRecordingStrategy(RecordingStrategy):
         shutil.rmtree(parts_dir, ignore_errors=True)
 
         if not main_ok:
-            # When the attempt loop already gave up, that is the root cause;
-            # unconvertible stubs are just its debris.
+            # A loop give-up is the root cause; unconvertible stubs are its debris.
             return DownloadResult(
                 success=False,
                 error=fail_error or "ffmpeg remux failed",

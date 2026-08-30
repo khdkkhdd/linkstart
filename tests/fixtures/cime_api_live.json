@@ -1,0 +1,29 @@
+{
+  "code": 200,
+  "data": {
+    "live": {
+      "id": 1006795,
+      "title": "테스트 방송 / sample stream",
+      "state": "ACTIVE",
+      "openedAt": "2026-06-04T12:34:56.000Z",
+      "imageUrl": "https://streaming.cf.ci.me/ivs/v1/406692415290/AbCdEfGh/2026/6/4/12/34/XyZw/media/latest_thumbnail/thumb.jpg",
+      "playback": {
+        "id": null,
+        "url": "https://example.playback.live-video.net/api/video/channel.m3u8",
+        "urlUhd": null,
+        "liveStreamId": 122208,
+        "isMultitrack": false,
+        "orientation": "HORIZONTAL"
+      },
+      "isAdult": true,
+      "curViewerCnt": 15,
+      "viewAccess": null,
+      "channel": {
+        "id": 1088182,
+        "slug": "sample_channel",
+        "name": "샘플",
+        "isLive": true
+      }
+    }
+  }
+}

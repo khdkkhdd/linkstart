@@ -29,6 +29,11 @@ class Platform(ABC):
     def build_url(self, channel: ChannelConfig, live: LiveInfo) -> str:
         """URL to pass to yt-dlp for downloading."""
 
+    def build_full_url(self, channel: ChannelConfig, live: LiveInfo) -> str | None:
+        """URL of a from-start (VOD) rendition of the running broadcast, if the
+        platform exposes one (e.g. IVS session recordings); None otherwise."""
+        return None
+
     def recording_strategy(self, ctx):
         """Return the RecordingStrategy for this platform; default is edge-only (HLS).
 

@@ -1,4 +1,5 @@
 """Tests for the CI.ME live-page platform adapter."""
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -11,13 +12,26 @@ from linkstart.platforms.cime import CimePlatform
 
 FIXTURES = Path(__file__).parent / "fixtures"
 PAGE_URL = "https://ci.me/@sample_channel/live"
+API_URL = "https://ci.me/api/app/page/live/sample_channel"
 PLAYBACK_URL = (
     "https://example.playback.live-video.net/api/video/channel.m3u8"
 )
+IVS_SESSION_PREFIX = (
+    "https://streaming.cf.ci.me/ivs/v1/406692415290/AbCdEfGh/2026/6/4/12/34/XyZw"
+)
+THUMBNAIL_URL = f"{IVS_SESSION_PREFIX}/media/latest_thumbnail/thumb.jpg"
+VOD_MASTER_URL = f"{IVS_SESSION_PREFIX}/media/hls/master.m3u8"
 
 
 def _fixture(name: str) -> str:
     return (FIXTURES / name).read_text(encoding="utf-8")
+
+
+def _api_live(**overrides) -> str:
+    """The live-page API fixture with ``data.live`` fields overridden."""
+    payload = json.loads(_fixture("cime_api_live.json"))
+    payload["data"]["live"].update(overrides)
+    return json.dumps(payload)
 
 
 @pytest.fixture
@@ -25,9 +39,9 @@ def channel():
     return ChannelConfig(platform="cime", channel_id="sample_channel")
 
 
-async def test_returns_live_info_from_json_ld(channel):
+async def test_returns_live_info_from_api(channel):
     with aioresponses() as mocked:
-        mocked.get(PAGE_URL, body=_fixture("cime_live.html"))
+        mocked.get(API_URL, body=_fixture("cime_api_live.json"))
         platform = CimePlatform()
         try:
             info = await platform.check_live(channel)
@@ -38,13 +52,14 @@ async def test_returns_live_info_from_json_ld(channel):
     assert info.live_id == "2026-06-04T12:34:56.000Z"
     assert info.title == "테스트 방송 / sample stream"
     assert info.url == PAGE_URL
-    assert info.thumbnail_url == "https://streaming.cf.ci.me/thumb.jpg"
+    assert info.thumbnail_url == THUMBNAIL_URL
     assert info.started_at == datetime(2026, 6, 4, 12, 34, 56, tzinfo=timezone.utc)
 
 
-async def test_returns_none_when_page_has_no_live_video(channel):
+async def test_returns_none_when_offline(channel):
+    body = json.dumps({"code": 200, "data": {"live": None}})
     with aioresponses() as mocked:
-        mocked.get(PAGE_URL, body=_fixture("cime_offline.html"))
+        mocked.get(API_URL, body=body)
         platform = CimePlatform()
         try:
             info = await platform.check_live(channel)
@@ -54,24 +69,42 @@ async def test_returns_none_when_page_has_no_live_video(channel):
     assert info is None
 
 
-async def test_returns_none_when_broadcast_event_is_not_live(channel):
-    html = _fixture("cime_live.html").replace(
-        '"isLiveBroadcast": true', '"isLiveBroadcast": false'
+async def test_returns_none_when_state_is_not_active(channel):
+    with aioresponses() as mocked:
+        mocked.get(API_URL, body=_api_live(state="ENDED"))
+        platform = CimePlatform()
+        try:
+            info = await platform.check_live(channel)
+        finally:
+            await platform.close()
+
+    assert info is None
+
+
+async def test_adult_live_without_playback_url_is_still_detected(
+    channel, caplog
+):
+    """Regression: a live must not be silently skipped when the playback URL
+    is missing (age-restricted broadcasts omit it from the public page)."""
+    with aioresponses() as mocked:
+        mocked.get(API_URL, body=_api_live(playback=None))
+        platform = CimePlatform()
+        try:
+            info = await platform.check_live(channel)
+        finally:
+            await platform.close()
+
+    assert info is not None
+    assert info.live_id == "2026-06-04T12:34:56.000Z"
+    assert any(
+        "no playback url" in record.message.lower()
+        for record in caplog.records
     )
+
+
+async def test_build_url_uses_playback_url_from_api(channel):
     with aioresponses() as mocked:
-        mocked.get(PAGE_URL, body=html)
-        platform = CimePlatform()
-        try:
-            info = await platform.check_live(channel)
-        finally:
-            await platform.close()
-
-    assert info is None
-
-
-async def test_build_url_uses_discovered_hls_master(channel):
-    with aioresponses() as mocked:
-        mocked.get(PAGE_URL, body=_fixture("cime_live.html"))
+        mocked.get(API_URL, body=_fixture("cime_api_live.json"))
         platform = CimePlatform()
         try:
             info = await platform.check_live(channel)
@@ -79,6 +112,49 @@ async def test_build_url_uses_discovered_hls_master(channel):
             assert platform.build_url(channel, info) == PLAYBACK_URL
         finally:
             await platform.close()
+
+
+async def test_build_full_url_derived_from_ivs_thumbnail(channel):
+    with aioresponses() as mocked:
+        mocked.get(API_URL, body=_fixture("cime_api_live.json"))
+        platform = CimePlatform()
+        try:
+            info = await platform.check_live(channel)
+            assert info is not None
+            assert platform.build_full_url(channel, info) == VOD_MASTER_URL
+        finally:
+            await platform.close()
+
+
+async def test_build_full_url_none_when_thumbnail_is_not_ivs(channel):
+    with aioresponses() as mocked:
+        mocked.get(
+            API_URL,
+            body=_api_live(imageUrl="https://streaming.cf.ci.me/plain.jpg"),
+        )
+        platform = CimePlatform()
+        try:
+            info = await platform.check_live(channel)
+            assert info is not None
+            assert platform.build_full_url(channel, info) is None
+        finally:
+            await platform.close()
+
+
+def test_build_full_url_none_for_unknown_live(channel):
+    platform = CimePlatform()
+    live = LiveInfo(live_id="unknown", title="x", url=PAGE_URL)
+    assert platform.build_full_url(channel, live) is None
+
+
+def test_cime_uses_snapshot_dual_strategy(channel):
+    from linkstart.downloader import Downloader
+    from linkstart.downloader._snapshot_dual import SnapshotDualRecordingStrategy
+
+    dl = Downloader()
+    strategy = CimePlatform().recording_strategy(dl)
+    assert isinstance(strategy, SnapshotDualRecordingStrategy)
+    assert strategy.ctx is dl
 
 
 def test_build_url_falls_back_to_public_page(channel):
@@ -107,9 +183,21 @@ def test_accepts_channel_id_with_at_prefix():
     assert platform.build_url(channel, live) == PAGE_URL
 
 
+async def test_returns_none_on_not_found(channel):
+    with aioresponses() as mocked:
+        mocked.get(API_URL, status=404)
+        platform = CimePlatform()
+        try:
+            info = await platform.check_live(channel)
+        finally:
+            await platform.close()
+
+    assert info is None
+
+
 async def test_returns_none_on_http_error(channel):
     with aioresponses() as mocked:
-        mocked.get(PAGE_URL, status=500)
+        mocked.get(API_URL, status=500)
         platform = CimePlatform()
         try:
             info = await platform.check_live(channel)
@@ -121,7 +209,7 @@ async def test_returns_none_on_http_error(channel):
 
 async def test_returns_none_on_network_error(channel):
     with aioresponses() as mocked:
-        mocked.get(PAGE_URL, exception=ConnectionError("boom"))
+        mocked.get(API_URL, exception=ConnectionError("boom"))
         platform = CimePlatform()
         try:
             info = await platform.check_live(channel)
@@ -131,10 +219,9 @@ async def test_returns_none_on_network_error(channel):
     assert info is None
 
 
-async def test_ignores_malformed_json_ld(channel):
-    html = '<script type="application/ld+json">{not json}</script>'
+async def test_returns_none_on_malformed_json(channel):
     with aioresponses() as mocked:
-        mocked.get(PAGE_URL, body=html)
+        mocked.get(API_URL, body="<html>not json</html>")
         platform = CimePlatform()
         try:
             info = await platform.check_live(channel)
