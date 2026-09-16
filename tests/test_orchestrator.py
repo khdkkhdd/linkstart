@@ -692,6 +692,31 @@ async def test_wait_timeout_path_keeps_polling(tmp_path, state):
     assert result_stop is True
 
 
+async def test_rerecord_after_finish_announces_again():
+    """A re-record of the same live after a finished recording (e.g. the edge
+    loop gave up during a network outage, then the broadcast was re-detected)
+    must notify again — silence here reads as \"recording never resumed\"."""
+    from linkstart.cooldown import Cooldown
+    from linkstart.orchestrator import ChannelNotifications
+
+    channel = ChannelConfig(platform="x", channel_id="y")
+    live = LiveInfo(live_id="1", title="t", url="https://x")
+    notifier = RecordingNotifier()
+    notifications = ChannelNotifications(notifier, channel, Cooldown(0))
+
+    await notifications.announce_live(live)
+    await notifications.announce_live(live)   # same live re-polled → deduped
+    await notifications.finished(
+        live, DownloadResult(success=True, file_path=Path("/x.mp4"))
+    )
+    await notifications.announce_live(live)   # re-record after finish
+
+    types = [e.type for e in notifier.events]
+    assert types.count(EventType.LIVE_STARTED) == 2
+    assert types.count(EventType.DOWNLOAD_STARTED) == 2
+    assert types.count(EventType.DOWNLOAD_FINISHED) == 1
+
+
 async def test_notifications_with_none_notifier_are_noop():
     """A channel without a notifier must run silently — no sends, no raises."""
     from linkstart.cooldown import Cooldown

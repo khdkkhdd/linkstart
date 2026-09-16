@@ -2953,3 +2953,227 @@ async def test_cleanup_dual_no_base_returns_failure(tmp_path):
     live = LiveInfo(live_id="100", title="hello", url="https://fake/abc")
     result = await cleanup_dual(paths, media, channel, live, parts, retry_count=0)
     assert result.success is False
+
+
+async def test_edge_only_reports_captured_bytes(channel, live):
+    """DownloadResult.captured_bytes = raw part bytes before remux, so
+    validation can judge the capture instead of a re-encoded artifact."""
+    plat = FakePlatform(check_results=[live, None])
+    dl = Downloader()
+    call_index = {"n": 0}
+
+    async def fake_exec(*args, **kwargs):
+        call_index["n"] += 1
+        out_idx = args.index("-o")
+        Path(args[out_idx + 1]).write_bytes(b"x" * (1000 * call_index["n"]))
+        return FakeProc(returncode=0)
+
+    async def fake_remux(part, target):
+        target.write_bytes(b"tiny")
+        return True
+
+    with patch.object(dl.media, "remux", new=AsyncMock(side_effect=fake_remux)):
+        with patch(
+            "linkstart.downloader._process.asyncio.create_subprocess_exec",
+            new=AsyncMock(side_effect=fake_exec),
+        ):
+            result = await dl.record(channel, plat, live)
+
+    assert result.success is True
+    assert result.captured_bytes == 3000   # 1000 + 2000, not the remuxed sizes
+
+
+async def test_record_passes_capture_metrics_to_validation(channel, live):
+    """Downloader.record must hand captured_bytes/captured_seconds to
+    platform.validate_recording."""
+    seen = {}
+
+    class ValidatingPlatform(FakePlatform):
+        async def validate_recording(self, file_path, **kwargs):
+            seen.update(kwargs)
+            from linkstart.models import ValidationResult
+            return ValidationResult(status="ok")
+
+    plat = ValidatingPlatform(check_results=[None])
+    dl = Downloader()
+
+    async def fake_exec(*args, **kwargs):
+        out_idx = args.index("-o")
+        Path(args[out_idx + 1]).write_bytes(b"x" * 5000)
+        return FakeProc(returncode=0)
+
+    async def fake_remux(part, target):
+        target.write_bytes(b"out")
+        return True
+
+    with patch.object(dl.media, "remux", new=AsyncMock(side_effect=fake_remux)):
+        with patch(
+            "linkstart.downloader._process.asyncio.create_subprocess_exec",
+            new=AsyncMock(side_effect=fake_exec),
+        ):
+            result = await dl.record(channel, plat, live)
+
+    assert result.success is True
+    assert seen.get("captured_bytes") == 5000
+    assert seen.get("captured_seconds") == result.duration_sec
+
+
+async def test_edge_only_keeps_raw_when_output_shrinks_suspiciously(channel, live):
+    """A remux 'success' whose output is <10% of the captured bytes may have
+    hollowed the recording — the source part is preserved raw for verification."""
+    plat = FakePlatform(check_results=[None])
+    dl = Downloader()
+
+    async def fake_exec(*args, **kwargs):
+        out_idx = args.index("-o")
+        Path(args[out_idx + 1]).write_bytes(b"x" * 100_000)
+        return FakeProc(returncode=0)
+
+    async def fake_remux(part, target):
+        target.write_bytes(b"y" * 500)   # 0.5% of the capture
+        return True
+
+    with patch.object(dl.media, "remux", new=AsyncMock(side_effect=fake_remux)):
+        with patch(
+            "linkstart.downloader._process.asyncio.create_subprocess_exec",
+            new=AsyncMock(side_effect=fake_exec),
+        ):
+            result = await dl.record(channel, plat, live)
+
+    assert result.success is True
+    raws = list(channel.save_dir.rglob("*.raw_*"))
+    assert len(raws) == 1
+    assert raws[0].read_bytes() == b"x" * 100_000
+
+
+async def test_edge_only_no_raw_kept_for_normal_shrink(channel, live):
+    """Ordinary remux (or healthy re-encode) shrink must NOT hoard raw copies."""
+    plat = FakePlatform(check_results=[None])
+    dl = Downloader()
+
+    async def fake_exec(*args, **kwargs):
+        out_idx = args.index("-o")
+        Path(args[out_idx + 1]).write_bytes(b"x" * 100_000)
+        return FakeProc(returncode=0)
+
+    async def fake_remux(part, target):
+        target.write_bytes(b"y" * 77_000)   # 77% — the real radio-salvage ratio
+        return True
+
+    with patch.object(dl.media, "remux", new=AsyncMock(side_effect=fake_remux)):
+        with patch(
+            "linkstart.downloader._process.asyncio.create_subprocess_exec",
+            new=AsyncMock(side_effect=fake_exec),
+        ):
+            result = await dl.record(channel, plat, live)
+
+    assert result.success is True
+    assert list(channel.save_dir.rglob("*.raw_*")) == []
+
+
+# ---------- edge placement: mpegts payloads must be remuxed, not renamed ----------
+
+async def _run_cleanup(dl, channel, live, parts_dir, monkeypatch, durations):
+    async def fake_ffprobe(path):
+        return durations.get(path)
+
+    async def fake_recover(*args, **kwargs):
+        return []
+
+    monkeypatch.setattr(dl.media, "ffprobe_duration", fake_ffprobe)
+    monkeypatch.setattr(
+        "linkstart.downloader._cleanup._recover_fragments", fake_recover
+    )
+    return await cleanup_dual(
+        dl.paths, dl.media, channel, live, parts_dir, retry_count=0
+    )
+
+
+async def test_cleanup_remuxes_mpegts_edge_keep(channel, live, tmp_path, monkeypatch):
+    """A kept edge whose bytes are MPEG-TS (0x47 sync) is remuxed into a real
+    mp4 — a plain rename ships an unplayable TS-in-mp4 (2026-08-31 file)."""
+    dl = Downloader()
+    parts_dir = tmp_path / "rec" / "fake" / "abc" / "parts.dir"
+    parts_dir.mkdir(parents=True)
+    base = parts_dir / "full.1000.mp4"; base.write_bytes(b"b")          # 1000~1100
+    edge = parts_dir / "edge.1050.mp4"; edge.write_bytes(b"\x47TSDATA")  # tail +50s
+
+    remuxed = []
+
+    async def fake_remux(src, dst):
+        remuxed.append((src.name, dst.name))
+        dst.write_bytes(b"REMUXED")
+        return True
+
+    monkeypatch.setattr(dl.media, "remux", fake_remux)
+    result = await _run_cleanup(
+        dl, channel, live, parts_dir, monkeypatch, {base: 100, edge: 100}
+    )
+
+    assert result.success is True
+    assert len(result.extra_files) == 1
+    assert result.extra_files[0].read_bytes() == b"REMUXED"
+    assert remuxed == [("edge.1050.mp4", result.extra_files[0].name)]
+
+
+async def test_cleanup_no_base_remuxes_mpegts_promotion(
+    channel, live, tmp_path, monkeypatch
+):
+    """Edge promoted to the final file (full snapshots all failed) must also be
+    remuxed — otherwise the MAIN recording is TS-in-mp4."""
+    dl = Downloader()
+    parts_dir = tmp_path / "rec" / "fake" / "abc" / "parts.dir"
+    parts_dir.mkdir(parents=True)
+    edge = parts_dir / "edge.1000.mp4"; edge.write_bytes(b"\x47TSDATA")
+
+    async def fake_remux(src, dst):
+        dst.write_bytes(b"REMUXED")
+        return True
+
+    monkeypatch.setattr(dl.media, "remux", fake_remux)
+    result = await _run_cleanup(
+        dl, channel, live, parts_dir, monkeypatch, {edge: 50}
+    )
+
+    assert result.success is True
+    assert result.file_path.read_bytes() == b"REMUXED"
+
+
+async def test_cleanup_edge_remux_failure_falls_back_to_rename(
+    channel, live, tmp_path, monkeypatch
+):
+    """Remux failure degrades to today's rename — captured bytes never lost."""
+    dl = Downloader()
+    parts_dir = tmp_path / "rec" / "fake" / "abc" / "parts.dir"
+    parts_dir.mkdir(parents=True)
+    edge = parts_dir / "edge.1000.mp4"; edge.write_bytes(b"\x47TSDATA")
+
+    monkeypatch.setattr(dl.media, "remux", AsyncMock(return_value=False))
+    result = await _run_cleanup(
+        dl, channel, live, parts_dir, monkeypatch, {edge: 50}
+    )
+
+    assert result.success is True
+    assert result.file_path.read_bytes() == b"\x47TSDATA"
+
+
+async def test_cleanup_mp4_edge_is_renamed_not_remuxed(
+    channel, live, tmp_path, monkeypatch
+):
+    """Real-mp4 edges (youtube dual) keep the zero-cost rename path."""
+    dl = Downloader()
+    parts_dir = tmp_path / "rec" / "fake" / "abc" / "parts.dir"
+    parts_dir.mkdir(parents=True)
+    base = parts_dir / "full.1000.mp4"; base.write_bytes(b"b")
+    edge = parts_dir / "edge.1050.mp4"
+    edge.write_bytes(b"\x00\x00\x00\x18ftypmp42")
+
+    remux = AsyncMock(return_value=True)
+    monkeypatch.setattr(dl.media, "remux", remux)
+    result = await _run_cleanup(
+        dl, channel, live, parts_dir, monkeypatch, {base: 100, edge: 100}
+    )
+
+    assert result.success is True
+    assert result.extra_files[0].read_bytes() == b"\x00\x00\x00\x18ftypmp42"
+    remux.assert_not_awaited()

@@ -3,6 +3,7 @@ import asyncio
 import logging
 from pathlib import Path
 
+from linkstart.downloader import _adts
 from linkstart.downloader._process import (
     LOG_STDERR_LIMIT,
     ProcessRunner,
@@ -19,10 +20,10 @@ class MediaTools:
     # Below this share of the source's duration, a fallback's exit-0 is truncation, not success.
     FALLBACK_MIN_DURATION_RATIO: float = 0.9
     FALLBACK_AUDIO_BITRATE: str = "160k"
-    # TwitCasting interleaves non-ADTS junk into the audio PID of some stream
-    # modes; aac_adtstoasc then always rejects the copy and the tolerant
-    # re-encode is the expected, correct path — not an anomaly worth warning.
+    # aac_adtstoasc's complaint about TwitCasting's audio-PID junk → surgical clean.
     ADTS_CONTAMINATION_MARKER: bytes = b"Error parsing ADTS frame header"
+    # Surgical cleaning reads the whole TS into memory; skip pathological sizes.
+    SURGICAL_MAX_TS_BYTES: int = 1_500_000_000
 
     def __init__(self, process: ProcessRunner,
                  ffmpeg_bin: str = "ffmpeg", ffprobe_bin: str = "ffprobe") -> None:
@@ -100,7 +101,17 @@ class MediaTools:
         if contaminated:
             log.info(
                 "copy remux rejected non-ADTS audio data in %s (known "
-                "twitcasting contamination) — re-encoding audio, video copied",
+                "twitcasting contamination) — trying surgical clean",
+                src.name,
+            )
+            if await self._remux_surgical(src, dst):
+                log.info(
+                    "surgical clean succeeded for %s → %s (lossless, gapless)",
+                    src.name, dst.name,
+                )
+                return True
+            log.warning(
+                "surgical clean failed for %s — re-encoding audio, video copied",
                 src.name,
             )
         else:
@@ -120,6 +131,93 @@ class MediaTools:
             return True
         dst.unlink(missing_ok=True)
         return False
+
+    async def _remux_surgical(self, src: Path, dst: Path) -> bool:
+        """Lossless contamination recovery: strip fillers, copy-remux original
+        video + cleaned audio; rejected unless the output decodes error-free."""
+        try:
+            if src.stat().st_size > self.SURGICAL_MAX_TS_BYTES:
+                log.info("surgical clean skipped for %s (too large)", src.name)
+                return False
+        except OSError:
+            return False
+
+        def _clean() -> bytes | None:
+            ts = src.read_bytes()
+            pid = _adts.find_audio_pid(ts)
+            if pid is None:
+                return None
+            cleaned, stats = _adts.clean_adts(_adts.extract_audio_es(ts, pid))
+            if not cleaned:
+                return None
+            log.info(
+                "surgical clean of %s: kept %s frames (%.0fs), dropped %s "
+                "fillers across %s boundaries",
+                src.name, stats["frames_kept"], stats["duration_sec"],
+                stats["frames_dropped"], stats["junk_regions"],
+            )
+            return cleaned
+
+        try:
+            cleaned = await asyncio.to_thread(_clean)
+        except Exception:
+            log.exception("surgical clean raised for %s", src)
+            return False
+        if cleaned is None:
+            return False
+
+        tmp = dst.with_name(dst.stem + ".cleanaudio.aac")
+        try:
+            tmp.write_bytes(cleaned)
+            returncode, _, stderr = await asyncio.wait_for(
+                self.process.run([
+                    self.ffmpeg_bin, "-nostdin", "-y",
+                    "-i", str(src), "-i", str(tmp),
+                    "-map", "0:v?", "-map", "1:a",
+                    "-c", "copy", str(dst),
+                ]),
+                timeout=self.FFMPEG_TIMEOUT_SEC,
+            )
+            if returncode != 0:
+                log.warning(
+                    "surgical remux failed: %s",
+                    _stderr_excerpt(stderr, LOG_STDERR_LIMIT),
+                )
+                return False
+
+            # Audio-only decode check — the untouched video slate has dts quirks.
+            returncode, _, stderr = await asyncio.wait_for(
+                self.process.run([
+                    self.ffmpeg_bin, "-nostdin", "-v", "error",
+                    "-i", str(dst), "-map", "0:a", "-f", "null", "-",
+                ]),
+                timeout=self.FFMPEG_TIMEOUT_SEC,
+            )
+            if returncode != 0 or stderr.strip():
+                log.warning(
+                    "surgical output fails decode verification: %s",
+                    _stderr_excerpt(stderr, LOG_STDERR_LIMIT),
+                )
+                return False
+
+            src_duration = await self.ffprobe_duration(src)
+            if src_duration is not None:
+                dst_duration = await self.ffprobe_duration(dst)
+                if (
+                    dst_duration is None
+                    or dst_duration < src_duration * self.FALLBACK_MIN_DURATION_RATIO
+                ):
+                    log.warning(
+                        "surgical output truncated for %s (%ss of %ss)",
+                        src.name, dst_duration, src_duration,
+                    )
+                    return False
+            return True
+        except asyncio.TimeoutError:
+            log.error("surgical remux timed out for %s", src)
+            return False
+        finally:
+            tmp.unlink(missing_ok=True)
 
     async def _remux_copy(self, src: Path, dst: Path) -> bytes | None:
         """Lossless container rewrite (copy codec). Returns None on success,

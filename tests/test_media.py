@@ -92,14 +92,15 @@ async def test_remux_logs_the_decisive_stderr_line(monkeypatch, tmp_path, caplog
     assert "moov atom not found" in msgs
 
 
-async def test_remux_known_adts_contamination_logs_calm_info(
+async def test_remux_contamination_unsalvageable_source_reencodes(
     monkeypatch, tmp_path, caplog
 ):
-    """TwitCasting streams routinely carry non-ADTS junk in the audio PID; the
-    copy remux then always fails on `aac_adtstoasc` and the tolerant re-encode
-    is the expected, correct path. That routine detour must log one calm INFO
-    line, not the three-warning ffmpeg dump reserved for unexpected failures."""
+    """No recoverable ADTS stream → tolerant re-encode; contamination stays calm INFO."""
+    from linkstart.downloader import _adts
     media = MediaTools(ProcessRunner())
+    src, dst = tmp_path / "a.ts", tmp_path / "b.mp4"
+    src.write_bytes(b"tsdata")
+    monkeypatch.setattr(_adts, "find_audio_pid", lambda ts: None)
     calls = []
 
     async def run(args, *, capture_stdout=False):
@@ -117,12 +118,10 @@ async def test_remux_known_adts_contamination_logs_calm_info(
     monkeypatch.setattr(media, "ffprobe_duration", fake_probe)
 
     with caplog.at_level(logging.INFO, logger="linkstart.downloader._media"):
-        ok = await media.remux(tmp_path / "a.ts", tmp_path / "b.mp4")
+        ok = await media.remux(src, dst)
 
     assert ok is True
-    assert len(calls) == 2
-    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
-    assert warnings == []
+    assert any("pan=stereo" in a for a in calls[-1])
     infos = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
     assert any("non-ADTS" in m for m in infos)
 
@@ -197,3 +196,212 @@ async def test_remux_fallback_accepted_when_source_unprobeable(monkeypatch, tmp_
 
     monkeypatch.setattr(media, "ffprobe_duration", fake_probe)
     assert await media.remux(tmp_path / "a.ts", tmp_path / "b.mp4") is True
+
+
+# ---------- surgical clean integration ----------
+
+def _patch_surgical_inputs(monkeypatch, es=b"ES", cleaned=b"CLEANED"):
+    from linkstart.downloader import _adts
+    monkeypatch.setattr(_adts, "find_audio_pid", lambda ts: 257)
+    monkeypatch.setattr(_adts, "extract_audio_es", lambda ts, pid: es)
+    monkeypatch.setattr(
+        _adts, "clean_adts",
+        lambda e: (cleaned, {"frames_kept": 9, "frames_dropped": 3,
+                             "junk_regions": 1, "duration_sec": 100.0}),
+    )
+
+
+async def test_remux_contamination_uses_surgical_clean_first(
+    monkeypatch, tmp_path, caplog
+):
+    """Contamination → surgical lossless clean; the hole-punching re-encode must NOT run."""
+    media = MediaTools(ProcessRunner())
+    src, dst = tmp_path / "a.ts", tmp_path / "b.mp4"
+    src.write_bytes(b"tsdata")
+    _patch_surgical_inputs(monkeypatch)
+    calls = []
+
+    async def run(args, *, capture_stdout=False):
+        calls.append(args)
+        if len(calls) == 1:   # copy remux fails on contamination
+            return 1, b"", b"[aac_adtstoasc] Error parsing ADTS frame header!\n"
+        if len(calls) == 2:   # surgical remux (src video + clean aac)
+            dst.write_bytes(b"out")
+            return 0, b"", b""
+        return 0, b"", b""    # decode-verify: clean stderr
+
+    monkeypatch.setattr(media.process, "run", run)
+    durations = {"a.ts": 100, "b.mp4": 97}
+
+    async def fake_probe(path):
+        return durations.get(path.name)
+
+    monkeypatch.setattr(media, "ffprobe_duration", fake_probe)
+
+    with caplog.at_level(logging.INFO, logger="linkstart.downloader._media"):
+        ok = await media.remux(src, dst)
+
+    assert ok is True
+    surgical = calls[1]
+    assert any(str(src) in a for a in surgical)
+    assert any(a.endswith(".aac") for a in map(str, surgical))
+    assert "-c" in surgical and "copy" in surgical
+    # Verify decodes audio only — the untouched video slate has dts quirks.
+    verify = calls[2]
+    assert "0:a" in verify and "0:v" not in " ".join(verify)
+    # No re-encode anywhere: three calls total, none with an aac encoder.
+    assert len(calls) == 3
+    assert not any("-c:a" in c for c in calls)
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warnings == []
+    # The clean-audio temp file must not linger.
+    assert list(tmp_path.glob("*.aac")) == []
+
+
+async def test_remux_surgical_failure_falls_back_to_tolerant(
+    monkeypatch, tmp_path
+):
+    media = MediaTools(ProcessRunner())
+    src, dst = tmp_path / "a.ts", tmp_path / "b.mp4"
+    src.write_bytes(b"tsdata")
+    _patch_surgical_inputs(monkeypatch)
+    calls = []
+
+    async def run(args, *, capture_stdout=False):
+        calls.append(args)
+        if len(calls) == 1:   # copy remux: contamination
+            return 1, b"", b"[aac_adtstoasc] Error parsing ADTS frame header!\n"
+        if len(calls) == 2:   # surgical remux fails
+            return 1, b"", b"boom"
+        dst.write_bytes(b"reencoded")
+        return 0, b"", b""    # tolerant re-encode succeeds
+
+    monkeypatch.setattr(media.process, "run", run)
+    durations = {"a.ts": 100, "b.mp4": 98}
+
+    async def fake_probe(path):
+        return durations.get(path.name)
+
+    monkeypatch.setattr(media, "ffprobe_duration", fake_probe)
+    ok = await media.remux(src, dst)
+
+    assert ok is True
+    assert any("pan=stereo" in a for a in calls[-1])   # tolerant path ran
+
+
+async def test_remux_surgical_rejects_dirty_decode(monkeypatch, tmp_path):
+    """Surgical output that still trips the decoder is rejected → fallback."""
+    media = MediaTools(ProcessRunner())
+    src, dst = tmp_path / "a.ts", tmp_path / "b.mp4"
+    src.write_bytes(b"tsdata")
+    _patch_surgical_inputs(monkeypatch)
+    calls = []
+
+    async def run(args, *, capture_stdout=False):
+        calls.append(args)
+        if len(calls) == 1:
+            return 1, b"", b"[aac_adtstoasc] Error parsing ADTS frame header!\n"
+        if len(calls) == 2:
+            dst.write_bytes(b"out")
+            return 0, b"", b""
+        if len(calls) == 3:   # decode-verify reports decoder errors
+            return 0, b"", b"[aac] channel element 1.13 is not allocated\n"
+        dst.write_bytes(b"reencoded")
+        return 0, b"", b""    # tolerant fallback
+
+    monkeypatch.setattr(media.process, "run", run)
+    durations = {"a.ts": 100, "b.mp4": 97}
+
+    async def fake_probe(path):
+        return durations.get(path.name)
+
+    monkeypatch.setattr(media, "ffprobe_duration", fake_probe)
+    ok = await media.remux(src, dst)
+
+    assert ok is True
+    assert any("pan=stereo" in a for a in calls[-1])
+
+
+async def test_remux_surgical_rejects_truncated_duration(monkeypatch, tmp_path):
+    media = MediaTools(ProcessRunner())
+    src, dst = tmp_path / "a.ts", tmp_path / "b.mp4"
+    src.write_bytes(b"tsdata")
+    _patch_surgical_inputs(monkeypatch)
+    calls = []
+
+    async def run(args, *, capture_stdout=False):
+        calls.append(args)
+        if len(calls) == 1:
+            return 1, b"", b"[aac_adtstoasc] Error parsing ADTS frame header!\n"
+        if len(calls) == 2:
+            dst.write_bytes(b"out")
+            return 0, b"", b""
+        if len(calls) == 3:
+            return 0, b"", b""
+        dst.write_bytes(b"reencoded")
+        return 0, b"", b""
+
+    monkeypatch.setattr(media.process, "run", run)
+
+    # Surgical dst probes half-length (rejected); tolerant's dst full-length.
+    async def fake_probe(path):
+        if path.name == "a.ts":
+            return 100
+        return 98 if len(calls) >= 4 else 50
+
+    monkeypatch.setattr(media, "ffprobe_duration", fake_probe)
+    ok = await media.remux(src, dst)
+
+    assert ok is True
+    assert any("pan=stereo" in a for a in calls[-1])
+
+
+async def test_remux_no_contamination_skips_surgical(monkeypatch, tmp_path):
+    """No ADTS marker → straight to re-encode; surgery is contamination-specific."""
+    media = MediaTools(ProcessRunner())
+    src, dst = tmp_path / "a.ts", tmp_path / "b.mp4"
+    src.write_bytes(b"tsdata")
+    calls = []
+
+    async def run(args, *, capture_stdout=False):
+        calls.append(args)
+        return (1, b"", b"moov atom not found") if len(calls) == 1 else (0, b"", b"")
+
+    monkeypatch.setattr(media.process, "run", run)
+
+    async def fake_probe(path):
+        return 100 if path.name == "a.ts" else 99
+
+    monkeypatch.setattr(media, "ffprobe_duration", fake_probe)
+    ok = await media.remux(src, dst)
+
+    assert ok is True
+    assert len(calls) == 2
+    assert any("pan=stereo" in a for a in calls[1])
+
+
+async def test_remux_surgical_skips_oversized_source(monkeypatch, tmp_path):
+    media = MediaTools(ProcessRunner())
+    media.SURGICAL_MAX_TS_BYTES = 3
+    src, dst = tmp_path / "a.ts", tmp_path / "b.mp4"
+    src.write_bytes(b"tsdata-larger-than-cap")
+    calls = []
+
+    async def run(args, *, capture_stdout=False):
+        calls.append(args)
+        if len(calls) == 1:
+            return 1, b"", b"[aac_adtstoasc] Error parsing ADTS frame header!\n"
+        dst.write_bytes(b"reencoded")
+        return 0, b"", b""
+
+    monkeypatch.setattr(media.process, "run", run)
+
+    async def fake_probe(path):
+        return 100 if path.name == "a.ts" else 99
+
+    monkeypatch.setattr(media, "ffprobe_duration", fake_probe)
+    ok = await media.remux(src, dst)
+
+    assert ok is True
+    assert len(calls) == 2                      # copy fail → tolerant only
+    assert any("pan=stereo" in a for a in calls[1])

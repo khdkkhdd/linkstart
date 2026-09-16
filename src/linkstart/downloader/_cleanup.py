@@ -53,6 +53,28 @@ def _new_coverage_seconds(candidate: Interval, covered: list[Interval]) -> int:
     return (c_end - c_start) - overlap_total
 
 
+def _is_mpegts(path: Path) -> bool:
+    try:
+        with path.open("rb") as f:
+            return f.read(1) == b"\x47"
+    except OSError:
+        return False
+
+
+async def _place_edge(media, src: Path, dst: Path) -> None:
+    """Move an edge capture to its final spot — TS bytes in a .mp4-named part
+    are remuxed to actually play; remux failure falls back to plain rename."""
+    if _is_mpegts(src):
+        if await media.remux(src, dst):
+            src.unlink(missing_ok=True)
+            return
+        log.warning(
+            "edge remux failed for %s — keeping raw TS bytes as %s",
+            src.name, dst.name,
+        )
+    src.rename(dst)
+
+
 def _edge_keep_path(base_final: Path, index: int) -> Path:
     return base_final.with_name(f"{base_final.stem}.edge_{index:03d}.mp4")
 
@@ -136,7 +158,7 @@ async def cleanup_dual(
         if d is None:
             # ffprobe failed — keep defensively, but do not extend coverage.
             kept = _edge_keep_path(base_final, keep_index)
-            f.rename(kept)
+            await _place_edge(media, f, kept)
             extras.append(kept)
             keep_index += 1
             continue
@@ -146,7 +168,7 @@ async def cleanup_dual(
             f.unlink(missing_ok=True)
         else:
             kept = _edge_keep_path(base_final, keep_index)
-            f.rename(kept)
+            await _place_edge(media, f, kept)
             extras.append(kept)
             keep_index += 1
             covered.append((epoch, edge_end))
@@ -201,10 +223,10 @@ async def _cleanup_no_base(
     extras: list[Path] = []
     if edge_files:
         base_final = unique_path(paths.final_path(channel, live))
-        edge_files[0].rename(base_final)
+        await _place_edge(media, edge_files[0], base_final)
         for i, f in enumerate(edge_files[1:], start=1):
             kept = _edge_keep_path(base_final, i)
-            f.rename(kept)
+            await _place_edge(media, f, kept)
             extras.append(kept)
     else:
         # Last-ditch: try fragment recovery into a fresh base.

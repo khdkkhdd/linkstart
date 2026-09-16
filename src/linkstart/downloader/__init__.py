@@ -28,7 +28,11 @@ class Downloader(_DownloaderBase):
             channel, platform, live, on_interrupted, stop_event
         )
         if result.success and result.file_path is not None:
-            result.validation = await platform.validate_recording(result.file_path)
+            result.validation = await platform.validate_recording(
+                result.file_path,
+                captured_bytes=result.captured_bytes,
+                captured_seconds=result.duration_sec,
+            )
         return result
 
 

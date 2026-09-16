@@ -46,6 +46,9 @@ class ChannelNotifications:
         await self._send(event)
 
     async def finished(self, live: LiveInfo, result: DownloadResult) -> None:
+        # A finished recording closes the announcement session: a re-record of
+        # the same live (e.g. re-detected after an outage) must notify again.
+        self._announced_live_id = None
         await self._send(
             Event(
                 EventType.DOWNLOAD_FINISHED,

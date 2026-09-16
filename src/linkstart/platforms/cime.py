@@ -37,8 +37,8 @@ class CimePlatform(Platform):
         self._owns_session = session is None
         # channel slug -> (live id, HLS master URL)
         self._playback_by_channel: dict[str, tuple[str, str]] = {}
-        # channel slug -> (live id, from-start VOD master URL)
-        self._full_by_channel: dict[str, tuple[str, str]] = {}
+        # True when the last check_live could not reach the API (vs. offline).
+        self._last_check_errored = False
 
     @staticmethod
     def _slug(channel: ChannelConfig) -> str:
@@ -72,6 +72,7 @@ class CimePlatform(Platform):
 
     async def check_live(self, channel: ChannelConfig) -> LiveInfo | None:
         cookies = self.get_auth_cookies(channel)
+        self._last_check_errored = False
         try:
             session = await self._get_session()
             async with polling_get(
@@ -90,6 +91,7 @@ class CimePlatform(Platform):
                 body = await resp.text()
         except (aiohttp.ClientError, asyncio.TimeoutError, ConnectionError) as e:
             log.warning("cime: request failed for %s: %s", channel.channel_id, e)
+            self._last_check_errored = True
             return None
 
         try:
@@ -124,14 +126,6 @@ class CimePlatform(Platform):
             )
 
         thumbnail = live.get("imageUrl")
-        if isinstance(thumbnail, str) and "/media/" in thumbnail:
-            session_prefix = thumbnail.split("/media/", 1)[0]
-            self._full_by_channel[slug] = (
-                live_id, f"{session_prefix}/media/hls/master.m3u8"
-            )
-        else:
-            self._full_by_channel.pop(slug, None)
-
         return LiveInfo(
             live_id=live_id,
             title=live.get("title") if isinstance(live.get("title"), str) else "",
@@ -147,15 +141,13 @@ class CimePlatform(Platform):
         # yt-dlp's generic extractor reads the page's JSON-LD — safe fallback.
         return self._page_url(channel)
 
-    def build_full_url(self, channel: ChannelConfig, live: LiveInfo) -> str | None:
-        cached = self._full_by_channel.get(self._slug(channel))
-        if cached is not None and cached[0] == live.live_id:
-            return cached[1]
-        return None
-
-    def recording_strategy(self, ctx):
-        from linkstart.downloader._snapshot_dual import SnapshotDualRecordingStrategy
-        return SnapshotDualRecordingStrategy(ctx)
+    async def is_still_live(self, channel: ChannelConfig, live_id: str) -> bool:
+        current = await self.check_live(channel)
+        if current is not None:
+            return current.live_id == live_id
+        # A failed reach is "unknown", not "ended" — don't end the recording on
+        # a transient network blip.
+        return self._last_check_errored
 
     def _base_download_profile(self, channel: ChannelConfig) -> DownloadProfile:
         # IVS HLS: native downloader + mpegts keeps interrupted captures playable.

@@ -137,6 +137,9 @@ class DownloadResult:
     error: str | None = None
     size_bytes: int = 0
     duration_sec: int = 0
+    # Raw bytes captured before any remux/re-encode — the honest signal for
+    # validation once the output may be re-encoded (0 = unknown).
+    captured_bytes: int = 0
     retry_count: int = 0
     validation: ValidationResult = field(
         default_factory=lambda: ValidationResult(status="ok")

@@ -325,3 +325,56 @@ async def test_owned_session_is_tuned_and_reused():
         assert first.connector._cached_hosts._ttl == DNS_CACHE_TTL_S
     finally:
         await platform.close()
+
+
+async def test_validate_recording_trusts_healthy_capture_bitrate(tmp_path):
+    """A quiet radio broadcast re-encodes to a tiny mp4, but the CAPTURE ran at
+    full stream bitrate — capture metrics must override the file probe
+    (2026-09-04/05 false 'login wall' flags on genuinely silent broadcasts)."""
+    platform = TwitcastingPlatform()
+    f = tmp_path / "silent.mp4"
+    f.write_bytes(b"x")
+
+    with patch.object(
+        platform, "_ffprobe_metrics",
+        new=AsyncMock(return_value={"duration_s": 1201.0, "bitrate_kbps": 4.0}),
+    ) as probe:
+        result = await platform.validate_recording(
+            f, captured_bytes=29_100_000, captured_seconds=1294,
+        )
+
+    assert result.status == "ok"
+    probe.assert_not_awaited()   # capture metrics decide; no file probe needed
+
+
+async def test_validate_recording_flags_low_capture_bitrate(tmp_path):
+    """The login-wall slate is also captured at ~52 kbps, so capture metrics
+    alone must still flag it."""
+    platform = TwitcastingPlatform()
+    f = tmp_path / "wall.mp4"
+    f.write_bytes(b"x")
+
+    result = await platform.validate_recording(
+        f, captured_bytes=27_800_000, captured_seconds=4278,
+    )
+
+    assert result.status == "invalid"
+    assert "login" in (result.reason or "").lower()
+
+
+async def test_validate_recording_short_capture_falls_back_to_file_probe(tmp_path):
+    """Capture shorter than the duration floor is not judged by capture rate —
+    the file probe (with its own floor) decides, as before."""
+    platform = TwitcastingPlatform()
+    f = tmp_path / "short.mp4"
+    f.write_bytes(b"x")
+
+    with patch.object(
+        platform, "_ffprobe_metrics",
+        new=AsyncMock(return_value={"duration_s": 30.0, "bitrate_kbps": 40.0}),
+    ):
+        result = await platform.validate_recording(
+            f, captured_bytes=150_000, captured_seconds=30,
+        )
+
+    assert result.status == "ok"

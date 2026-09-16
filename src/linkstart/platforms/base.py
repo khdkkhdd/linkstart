@@ -29,11 +29,6 @@ class Platform(ABC):
     def build_url(self, channel: ChannelConfig, live: LiveInfo) -> str:
         """URL to pass to yt-dlp for downloading."""
 
-    def build_full_url(self, channel: ChannelConfig, live: LiveInfo) -> str | None:
-        """URL of a from-start (VOD) rendition of the running broadcast, if the
-        platform exposes one (e.g. IVS session recordings); None otherwise."""
-        return None
-
     def recording_strategy(self, ctx):
         """Return the RecordingStrategy for this platform; default is edge-only (HLS).
 
@@ -69,6 +64,10 @@ class Platform(ABC):
         """Release platform-owned resources (HTTP sessions, etc.)."""
         return None
 
-    async def validate_recording(self, file_path: Path) -> ValidationResult:
-        """Check a finished recording for silent-failure signatures; default accepts all."""
+    async def validate_recording(
+        self, file_path: Path, *,
+        captured_bytes: int = 0, captured_seconds: float = 0,
+    ) -> ValidationResult:
+        """Check a finished recording for silent-failure signatures; default accepts all.
+        Capture metrics, when nonzero, describe the pre-remux download."""
         return ValidationResult(status="ok")

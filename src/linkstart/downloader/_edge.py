@@ -21,6 +21,8 @@ log = logging.getLogger(__name__)
 
 
 class EdgeRecordingStrategy(RecordingStrategy):
+    # Output below this share of its capture triggers raw-evidence preservation.
+    SUSPICIOUS_SHRINK_RATIO: float = 0.10
     EDGE_STALL_SEC: float = 45.0
     EDGE_STALL_GRACE_SEC: float = 30.0
     EDGE_MIN_BYTES_PER_SEC: float = 1024.0
@@ -81,6 +83,7 @@ class EdgeRecordingStrategy(RecordingStrategy):
 
         # First part that remuxes → final file, later ones → extras; a part
         # ffmpeg cannot convert is preserved raw, never deleted unconverted.
+        captured_bytes = sum(p.stat().st_size for p in part_files)
         final_path = unique_path(ctx.paths.final_path(channel, live))
         extras: list[Path] = []
         main_ok = False
@@ -96,6 +99,21 @@ class EdgeRecordingStrategy(RecordingStrategy):
                 if main_ok:
                     extras.append(target)
                 main_ok = True
+                # A "successful" output far smaller than its capture may be
+                # hollow (e.g. re-encode collapsed to silence) — keep evidence.
+                part_size = part.stat().st_size if part.exists() else 0
+                out_size = target.stat().st_size if target.exists() else 0
+                if part_size and out_size < part_size * self.SUSPICIOUS_SHRINK_RATIO:
+                    raw_path = unique_path(final_path.with_name(
+                        f"{final_path.stem}.raw_{raw_index:03d}{suffix}"
+                    ))
+                    part.rename(raw_path)
+                    raw_index += 1
+                    log.warning(
+                        "remux of %s shrank %dx (%d → %d bytes) — raw kept as %s",
+                        part.name, part_size // max(out_size, 1),
+                        part_size, out_size, raw_path.name,
+                    )
             else:
                 raw_path = unique_path(final_path.with_name(
                     f"{final_path.stem}.raw_{raw_index:03d}{suffix}"
@@ -139,5 +157,6 @@ class EdgeRecordingStrategy(RecordingStrategy):
             extra_files=extras,
             size_bytes=size,
             duration_sec=duration,
+            captured_bytes=captured_bytes,
             retry_count=retries,
         )

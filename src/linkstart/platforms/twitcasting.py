@@ -101,7 +101,30 @@ class TwitcastingPlatform(Platform):
         # mid-write — important for long live captures.
         return DownloadProfile(container="mpegts")
 
-    async def validate_recording(self, file_path: Path) -> ValidationResult:
+    async def validate_recording(
+        self, file_path: Path, *,
+        captured_bytes: int = 0, captured_seconds: float = 0,
+    ) -> ValidationResult:
+        # Capture metrics decide when available: the output may be re-encoded
+        # (quiet audio legitimately compresses below the login-wall threshold),
+        # while the capture always ran at the stream's true bitrate.
+        if captured_bytes > 0 and captured_seconds > self.LOGIN_WALL_MIN_DURATION_S:
+            capture_kbps = captured_bytes * 8 / captured_seconds / 1000
+            metrics = {
+                "duration_s": float(captured_seconds),
+                "bitrate_kbps": capture_kbps,
+            }
+            if capture_kbps < self.LOGIN_WALL_MAX_BITRATE_KBPS:
+                return ValidationResult(
+                    status="invalid",
+                    reason=(
+                        f"likely login wall: captured {capture_kbps:.0f} kbps "
+                        f"over {captured_seconds:.0f}s"
+                    ),
+                    metrics=metrics,
+                )
+            return ValidationResult(status="ok", metrics=metrics)
+
         metrics = await self._ffprobe_metrics(file_path)
         if metrics is None:
             return ValidationResult(status="ok")

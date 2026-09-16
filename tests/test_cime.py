@@ -16,11 +16,10 @@ API_URL = "https://ci.me/api/app/page/live/sample_channel"
 PLAYBACK_URL = (
     "https://example.playback.live-video.net/api/video/channel.m3u8"
 )
-IVS_SESSION_PREFIX = (
+THUMBNAIL_URL = (
     "https://streaming.cf.ci.me/ivs/v1/406692415290/AbCdEfGh/2026/6/4/12/34/XyZw"
+    "/media/latest_thumbnail/thumb.jpg"
 )
-THUMBNAIL_URL = f"{IVS_SESSION_PREFIX}/media/latest_thumbnail/thumb.jpg"
-VOD_MASTER_URL = f"{IVS_SESSION_PREFIX}/media/hls/master.m3u8"
 
 
 def _fixture(name: str) -> str:
@@ -114,46 +113,15 @@ async def test_build_url_uses_playback_url_from_api(channel):
             await platform.close()
 
 
-async def test_build_full_url_derived_from_ivs_thumbnail(channel):
-    with aioresponses() as mocked:
-        mocked.get(API_URL, body=_fixture("cime_api_live.json"))
-        platform = CimePlatform()
-        try:
-            info = await platform.check_live(channel)
-            assert info is not None
-            assert platform.build_full_url(channel, info) == VOD_MASTER_URL
-        finally:
-            await platform.close()
-
-
-async def test_build_full_url_none_when_thumbnail_is_not_ivs(channel):
-    with aioresponses() as mocked:
-        mocked.get(
-            API_URL,
-            body=_api_live(imageUrl="https://streaming.cf.ci.me/plain.jpg"),
-        )
-        platform = CimePlatform()
-        try:
-            info = await platform.check_live(channel)
-            assert info is not None
-            assert platform.build_full_url(channel, info) is None
-        finally:
-            await platform.close()
-
-
-def test_build_full_url_none_for_unknown_live(channel):
-    platform = CimePlatform()
-    live = LiveInfo(live_id="unknown", title="x", url=PAGE_URL)
-    assert platform.build_full_url(channel, live) is None
-
-
-def test_cime_uses_snapshot_dual_strategy(channel):
+def test_cime_uses_edge_strategy(channel):
+    # ci.me blocked IVS origin access (403), so the from-start VOD snapshot is
+    # dead; cime records edge-only like the other HLS-live platforms.
     from linkstart.downloader import Downloader
-    from linkstart.downloader._snapshot_dual import SnapshotDualRecordingStrategy
+    from linkstart.downloader._edge import EdgeRecordingStrategy
 
     dl = Downloader()
     strategy = CimePlatform().recording_strategy(dl)
-    assert isinstance(strategy, SnapshotDualRecordingStrategy)
+    assert isinstance(strategy, EdgeRecordingStrategy)
     assert strategy.ctx is dl
 
 
@@ -229,6 +197,41 @@ async def test_returns_none_on_malformed_json(channel):
             await platform.close()
 
     assert info is None
+
+
+async def test_is_still_live_true_for_same_broadcast(channel):
+    with aioresponses() as mocked:
+        mocked.get(API_URL, body=_fixture("cime_api_live.json"))
+        platform = CimePlatform()
+        try:
+            assert await platform.is_still_live(
+                channel, "2026-06-04T12:34:56.000Z"
+            ) is True
+        finally:
+            await platform.close()
+
+
+async def test_is_still_live_false_when_broadcast_gone(channel):
+    body = json.dumps({"code": 200, "data": {"live": None}})
+    with aioresponses() as mocked:
+        mocked.get(API_URL, body=body)
+        platform = CimePlatform()
+        try:
+            assert await platform.is_still_live(channel, "any") is False
+        finally:
+            await platform.close()
+
+
+async def test_is_still_live_true_on_network_error(channel):
+    """A DNS/connection failure means \"unknown\", not \"ended\": treating it as
+    ended splits the recording every time the network blips."""
+    with aioresponses() as mocked:
+        mocked.get(API_URL, exception=ConnectionError("boom"))
+        platform = CimePlatform()
+        try:
+            assert await platform.is_still_live(channel, "any") is True
+        finally:
+            await platform.close()
 
 
 def test_get_auth_cookies_with_browser(monkeypatch):
