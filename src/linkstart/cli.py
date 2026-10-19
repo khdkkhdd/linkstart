@@ -25,7 +25,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = argparse.ArgumentParser(prog="linkstart", parents=[common])
     sub = p.add_subparsers(dest="command", required=True)
-    sub.add_parser("run", parents=[common], help="Run the recorder daemon")
+    viewer_options = argparse.ArgumentParser(add_help=False)
+    viewer_options.add_argument("--host", default=argparse.SUPPRESS, help="Viewer bind address (default: 127.0.0.1)")
+    viewer_options.add_argument("--port", type=int, default=argparse.SUPPRESS, help="Viewer port (default: 8788)")
+    run = sub.add_parser("run", parents=[common, viewer_options], help="Run the recorder daemon")
+    run.add_argument("--serve", action="store_true", help="Also run the recording viewer (same as serve)")
     sub.add_parser(
         "list",
         parents=[common],
@@ -37,11 +41,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run one live-state check for a configured channel (debugging)",
     )
     check.add_argument("channel_idx", type=int)
+    sub.add_parser("serve", parents=[common, viewer_options], help="Browse and play recordings")
     return p
 
 
 def parse_args(argv=None):
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.command == "run" and not args.serve and (hasattr(args, "host") or hasattr(args, "port")):
+        parser.error("run: --host and --port require --serve")
+    if args.command in ("run", "serve"):
+        if not hasattr(args, "host"):
+            args.host = "127.0.0.1"
+        if not hasattr(args, "port"):
+            args.port = 8788
+        if not 1 <= args.port <= 65535:
+            parser.error("--port must be between 1 and 65535")
     if not hasattr(args, "config"):
         args.config = Path("config.yaml")
     return args
@@ -153,9 +168,23 @@ async def cmd_run(args) -> int:
             )
         )
 
+    viewer_runner = None
     try:
+        if getattr(args, "serve", False):
+            from aiohttp import web
+            from linkstart.viewer import create_app
+            viewer_runner = web.AppRunner(create_app(config))
+            try:
+                await viewer_runner.setup()
+                await web.TCPSite(viewer_runner, args.host, args.port).start()
+            except OSError as exc:
+                print(f"Could not start viewer on {args.host}:{args.port}: {exc}", file=sys.stderr)
+                return 1
+            logging.getLogger(__name__).info("recording viewer at http://%s:%s", args.host, args.port)
         await orch.run()
     finally:
+        if viewer_runner is not None:
+            await viewer_runner.cleanup()
         if summary_task is not None:
             summary_task.cancel()
         for p in platforms.values():
@@ -206,6 +235,11 @@ async def cmd_check(args) -> int:
 def main() -> int:
     configure_logging()
     args = parse_args()
+    if args.command == "serve":
+        from aiohttp import web
+        from linkstart.viewer import create_app
+        web.run_app(create_app(load_config(args.config)), host=args.host, port=args.port)
+        return 0
     if args.command == "run":
         return asyncio.run(cmd_run(args))
     if args.command == "list":

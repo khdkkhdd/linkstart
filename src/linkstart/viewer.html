@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="ko">
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>LinkStart · 녹화 보관함</title>
+<style>
+:root{color-scheme:dark;--bg:#111315;--surface:#1b1e21;--ink:#f1f3f5;--muted:#a4adb5;--accent:#a7e2c5}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 system-ui,sans-serif}main{max-width:1100px;margin:auto;padding:28px 24px}header{display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #343a40;padding-bottom:18px}header strong{font-size:21px}header span{color:var(--accent);font-size:13px}h1{font-size:24px;margin:28px 0 4px}p{color:var(--muted);margin:4px 0 18px}video{width:100%;max-height:60vh;background:#000;border-radius:10px;display:block}#now{font-size:18px;overflow-wrap:anywhere}a{color:var(--accent)}.tools{display:flex;gap:12px;flex-wrap:wrap;margin:28px 0 14px}input,select,button{font:inherit;background:var(--surface);color:var(--ink);border:1px solid #40474e;border-radius:7px;padding:10px 12px}input{flex:1;min-width:160px}button{cursor:pointer}button:hover{border-color:var(--accent)}button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid var(--accent);outline-offset:3px}.record{display:block;width:100%;text-align:left;margin:8px 0;padding:16px}.record strong{display:block;overflow-wrap:anywhere}.record small{color:var(--muted)}.record[aria-pressed=true]{border-color:var(--accent);background:#203029}#message{color:var(--muted)}#error{color:#ffb8b8}.actions{display:flex;gap:18px;align-items:center;margin:12px 0}#count{font-size:14px;color:var(--muted)}@media(max-width:600px){main{padding:18px 14px}h1{font-size:21px}.tools{gap:8px}video{max-height:50vh}}
+</style>
+<main>
+<header><strong>LinkStart</strong><span>녹화 보관함</span></header>
+<h1>최근 녹화</h1><p>보고 싶은 방송을 선택하고, 이어서 감상하세요.</p>
+<video id="player" controls playsinline preload="metadata"></video>
+<div class="actions"><strong id="now">영상을 선택하세요</strong><a id="download" hidden download>다운로드</a></div>
+<p id="error" role="alert" hidden>이 브라우저에서 재생할 수 없는 영상입니다. 다운로드하거나 영상 주소를 VLC에서 열어 주세요.</p>
+<div class="tools"><select id="platform" aria-label="플랫폼"><option value="twitcasting">TwitCasting</option><option value="">모든 플랫폼</option></select><input id="search" type="search" placeholder="채널 또는 영상 검색" aria-label="채널 또는 영상 검색"><button id="refresh">새로고침</button></div>
+<div id="count"></div><p id="message" role="status">녹화 목록을 불러오는 중…</p><div id="list"></div>
+</main>
+<script>
+const $=id=>document.getElementById(id);let items=[],selected=null;const player=$('player');
+function stored(key){try{return Number(localStorage.getItem(key))||0}catch{return 0}}
+function select(item,play=false){selected=item;player.src=item.url;$('now').textContent=item.name;$('download').href=item.url;$('download').hidden=false;$('error').hidden=true;player.onloadedmetadata=()=>{const t=stored(item.url);if(t>0&&t<player.duration-5)player.currentTime=t;if(play)player.play().catch(()=>{})};render()}
+let lastSave=0;player.addEventListener('timeupdate',()=>{if(selected&&Date.now()-lastSave>3000){lastSave=Date.now();try{localStorage.setItem(selected.url,String(player.currentTime))}catch{}}});player.addEventListener('ended',()=>{if(selected)try{localStorage.removeItem(selected.url)}catch{}});player.addEventListener('error',()=>{$('error').hidden=false});
+function filtered(){const q=$('search').value.toLowerCase();return items.filter(i=>(!$('platform').value||i.platform===$('platform').value)&&(`${i.name} ${i.channel}`.toLowerCase().includes(q)))}
+function render(){const visible=filtered();$('list').replaceChildren();$('count').textContent=`${visible.length}개 · 최신순`;$('message').textContent=visible.length?'':'조건에 맞는 완료된 녹화가 없습니다.';for(const item of visible){const button=document.createElement('button');button.className='record';button.setAttribute('aria-pressed',String(selected?.url===item.url));const title=document.createElement('strong');title.textContent=item.name;const meta=document.createElement('small');meta.textContent=`${item.platform} / ${item.channel} · ${new Date(item.modified*1000).toLocaleString('ko-KR')} · ${(item.size/1024**2).toFixed(1)} MB`;button.append(title,meta);button.onclick=()=>select(item,true);$('list').append(button)}}
+async function load(){try{const response=await fetch('/api/recordings');if(!response.ok)throw Error();items=await response.json();const platforms=[...new Set(items.map(i=>i.platform))];for(const p of platforms)if(![...$('platform').options].some(o=>o.value===p))$('platform').add(new Option(p,p));render();if(!selected&&filtered().length)select(filtered()[0])}catch{$('message').textContent='목록을 불러오지 못했습니다. 새로고침해 주세요.'}}
+$('search').oninput=render;$('platform').onchange=()=>{render();if(filtered().length)select(filtered()[0])};$('refresh').onclick=load;load();setInterval(load,60000);
+</script>
+</html>

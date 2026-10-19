@@ -559,3 +559,52 @@ def test_main_dispatches_to_subcommands(monkeypatch):
         rc = cli.main()
     assert rc == 0
     m_check.assert_called_once()
+
+
+def test_viewer_options_are_shared():
+    for command in (["run", "--serve"], ["serve"]):
+        args = parse_args(command)
+        assert (args.host, args.port) == ("127.0.0.1", 8788)
+        args = parse_args([*command, "--host", "127.0.0.2", "--port", "9000"])
+        assert (args.host, args.port) == ("127.0.0.2", 9000)
+
+
+def test_run_viewer_options_require_serve():
+    import pytest
+    for options in (["--port", "9000"], ["--host", "127.0.0.1"]):
+        with pytest.raises(SystemExit):
+            parse_args(["run", *options])
+    for command in (["run", "--serve"], ["serve"]):
+        with pytest.raises(SystemExit):
+            parse_args([*command, "--port", "65536"])
+
+
+async def test_run_viewer_lifecycle_and_bind_failure(tmp_path, capsys):
+    from linkstart.cli import cmd_run
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("channels: []\n")
+    args = parse_args(["run", "--serve", "--config", str(cfg), "--port", "9000"])
+    for failure in (None, OSError("Address already in use"), RuntimeError("recorder failed")):
+        orch = AsyncMock()
+        if isinstance(failure, RuntimeError):
+            orch.run.side_effect = failure
+        runner = AsyncMock()
+        site = AsyncMock()
+        if isinstance(failure, OSError):
+            site.start.side_effect = failure
+        platform = AsyncMock()
+        with patch("linkstart.cli.configure_diagnostics"), patch("linkstart.cli.StateStore"), patch("linkstart.cli.Orchestrator", return_value=orch), patch("linkstart.cli._build_platforms", return_value={"test": platform}), patch("aiohttp.web.AppRunner", return_value=runner), patch("aiohttp.web.TCPSite", return_value=site) as site_factory:
+            if isinstance(failure, RuntimeError):
+                import pytest
+                with pytest.raises(RuntimeError, match="recorder failed"):
+                    await cmd_run(args)
+            else:
+                assert await cmd_run(args) == (1 if failure else 0)
+            site_factory.assert_called_once_with(runner, "127.0.0.1", 9000)
+            runner.cleanup.assert_awaited_once()
+            platform.close.assert_awaited_once()
+            if isinstance(failure, OSError):
+                orch.run.assert_not_awaited()
+                assert "Address already in use" in capsys.readouterr().err
+            else:
+                orch.run.assert_awaited_once()

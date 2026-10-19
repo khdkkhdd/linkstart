@@ -141,6 +141,21 @@ The webhook URL is treated as a secret — keep `config.yaml` out of version con
 
 ## CLI
 
+### Remote recording viewer
+
+```bash
+uv run linkstart run --serve                 # recorder + viewer, one process
+uv run linkstart run --serve --port 9000     # custom viewer port
+uv run linkstart serve --config config.yaml # viewer only, localhost:8788
+tailscale serve --bg --http=8787 http://127.0.0.1:8788
+```
+
+On a Tailscale-connected device, open `http://<server-name>:8787` (use your server's MagicDNS name). The viewer defaults to the latest TwitCasting recording, with search, platform filters, native video controls, downloads, and per-browser resume positions. The list refreshes every minute. Only completed MP4s at `{save_dir}/{platform}/{channel}/*.mp4` are served, including per-channel save roots; recording parts and paths outside those roots are excluded. Browser playback requires compatible codecs; use the download link or open the media URL in VLC otherwise. Tailscale access rules determine who can view recordings.
+
+`run --serve` runs the viewer alongside recording in the same process; stopping the recorder also stops the viewer. `serve` runs only the viewer. Both accept `--host` (default `127.0.0.1`) and `--port` (default `8788`). With `run`, these options require `--serve`. A viewer startup failure stops startup before recording begins. Stop any standalone viewer on the same port before switching to `run --serve`, or choose a different port and update the Tailscale proxy accordingly. Keep the viewer bound to localhost and use Tailscale Serve for tailnet access. To stop sharing this port: `tailscale serve --http=8787 off`.
+
+For unattended use, run the command in a persistent `tmux` session or configure a service manager. On macOS, a LaunchAgent may need separate permission to access Downloads even when terminal access works.
+
 ```bash
 uv run linkstart run                  # run the recorder daemon
 uv run linkstart list                 # list configured channels + last-seen live ids
